@@ -10,24 +10,31 @@ use crate::backend::{StoredEntry, StoredValue};
 use crate::error::{CacheError, CacheResult};
 
 // Redis GET/MGET responses do not include per-key TTL metadata.
-// This placeholder keeps StoredEntry non-expired for value transport only.
+// This placeholder keeps `StoredEntry` non-expired for value transport only.
 // Real expiration remains enforced by Redis through PSETEX at write time.
 const REDIS_READ_PLACEHOLDER_TTL: Duration = Duration::from_secs(3600);
 
+/// JSON wire format persisted in Redis value bytes.
 #[derive(Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "value")]
 enum RedisStoredValue<V> {
+    /// Real business value.
     Value(V),
+    /// Negative-cache marker.
     Null,
 }
 
+/// Remote backend implemented with Redis.
 #[derive(Clone)]
 pub struct RedisBackend<V>
 where
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    /// Redis client handle.
     client: redis::Client,
+    /// Optional key prefix to isolate logical business domains.
     key_prefix: String,
+    /// Type marker.
     _marker: PhantomData<V>,
 }
 
@@ -35,6 +42,7 @@ impl<V> RedisBackend<V>
 where
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    /// Creates a new redis backend.
     fn new(client: redis::Client, key_prefix: String) -> Self {
         Self {
             client,
@@ -43,6 +51,7 @@ where
         }
     }
 
+    /// Applies configured key prefix.
     fn prefixed_key(&self, key: &str) -> String {
         if self.key_prefix.is_empty() {
             key.to_string()
@@ -51,6 +60,7 @@ where
         }
     }
 
+    /// Encodes stored value into json bytes.
     fn to_payload(value: StoredValue<V>) -> CacheResult<Vec<u8>> {
         let payload = match value {
             StoredValue::Value(value) => RedisStoredValue::Value(value),
@@ -61,6 +71,7 @@ where
             .map_err(|err| CacheError::Backend(format!("serialize redis payload failed: {err}")))
     }
 
+    /// Decodes json bytes into stored value.
     fn from_payload(bytes: &[u8]) -> CacheResult<StoredValue<V>> {
         let value: RedisStoredValue<V> = serde_json::from_slice(bytes).map_err(|err| {
             CacheError::Backend(format!("deserialize redis payload failed: {err}"))
@@ -72,6 +83,7 @@ where
         })
     }
 
+    /// Converts absolute expiration time to redis millisecond TTL.
     fn ttl_ms(expire_at: Instant) -> u64 {
         expire_at
             .saturating_duration_since(Instant::now())
@@ -79,6 +91,7 @@ where
             .max(1) as u64
     }
 
+    /// Opens a multiplexed async redis connection.
     async fn connection(&self) -> CacheResult<redis::aio::MultiplexedConnection> {
         self.client
             .get_multiplexed_async_connection()
@@ -86,6 +99,7 @@ where
             .map_err(|err| CacheError::Backend(format!("redis connection failed: {err}")))
     }
 
+    /// Reads one key from redis.
     pub async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
         let full_key = self.prefixed_key(key);
         let mut conn = self.connection().await?;
@@ -105,6 +119,7 @@ where
         }))
     }
 
+    /// Reads multiple keys with Redis MGET and returns key-indexed map.
     pub async fn mget(
         &self,
         keys: &[String],
@@ -135,6 +150,7 @@ where
         Ok(values)
     }
 
+    /// Writes one key using Redis PSETEX.
     pub async fn set(&self, key: &str, entry: StoredEntry<V>) -> CacheResult<()> {
         let full_key = self.prefixed_key(key);
         let payload = Self::to_payload(entry.value)?;
@@ -148,6 +164,7 @@ where
         Ok(())
     }
 
+    /// Writes multiple keys with pipeline PSETEX commands.
     pub async fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> CacheResult<()> {
         let mut pipe = redis::pipe();
         for (key, entry) in entries {
@@ -166,6 +183,30 @@ where
         Ok(())
     }
 
+    /// Publishes invalidation payload to a Redis channel.
+    pub async fn publish(&self, channel: &str, payload: &str) -> CacheResult<()> {
+        let mut conn = self.connection().await?;
+        let _: usize = conn
+            .publish(channel, payload)
+            .await
+            .map_err(|err| CacheError::Backend(format!("redis PUBLISH failed: {err}")))?;
+        Ok(())
+    }
+
+    /// Subscribes to a Redis Pub/Sub channel.
+    pub async fn subscribe(&self, channel: &str) -> CacheResult<redis::aio::PubSub> {
+        let mut pubsub =
+            self.client.get_async_pubsub().await.map_err(|err| {
+                CacheError::Backend(format!("redis pubsub connect failed: {err}"))
+            })?;
+        pubsub
+            .subscribe(channel)
+            .await
+            .map_err(|err| CacheError::Backend(format!("redis SUBSCRIBE failed: {err}")))?;
+        Ok(pubsub)
+    }
+
+    /// Deletes one key from Redis.
     pub async fn del(&self, key: &str) -> CacheResult<()> {
         let full_key = self.prefixed_key(key);
         let mut conn = self.connection().await?;
@@ -176,6 +217,7 @@ where
         Ok(())
     }
 
+    /// Deletes multiple keys from Redis.
     pub async fn mdel(&self, keys: &[String]) -> CacheResult<()> {
         let full_keys: Vec<String> = keys.iter().map(|key| self.prefixed_key(key)).collect();
         let mut conn = self.connection().await?;
@@ -187,14 +229,19 @@ where
     }
 }
 
+/// Builder for `RedisBackend`.
 #[derive(Clone, Debug)]
 pub struct RedisBuilder<V> {
+    /// Redis connection URL.
     url: String,
+    /// Optional key prefix.
     key_prefix: String,
+    /// Type marker.
     _marker: PhantomData<V>,
 }
 
 impl<V> Default for RedisBuilder<V> {
+    /// Returns default redis builder.
     fn default() -> Self {
         Self {
             url: "redis://127.0.0.1:6379".to_string(),
@@ -208,16 +255,19 @@ impl<V> RedisBuilder<V>
 where
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    /// Sets redis URL.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = url.into();
         self
     }
 
+    /// Sets key prefix used by this backend.
     pub fn key_prefix(mut self, key_prefix: impl Into<String>) -> Self {
         self.key_prefix = key_prefix.into();
         self
     }
 
+    /// Builds redis backend and validates URL format.
     pub fn build(self) -> CacheResult<RedisBackend<V>> {
         let client = redis::Client::open(self.url)
             .map_err(|err| CacheError::InvalidConfig(format!("invalid redis URL: {err}")))?;
@@ -225,6 +275,7 @@ where
     }
 }
 
+/// Returns a redis backend builder.
 pub fn redis<V>() -> RedisBuilder<V>
 where
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,

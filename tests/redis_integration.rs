@@ -352,3 +352,71 @@ async fn level_cache_loader_timeout_is_reported_with_remote_backend() {
     let err = cache.get(&1, &ReadOptions::default()).await.unwrap_err();
     assert!(matches!(err, accelerator::CacheError::Timeout("loader")));
 }
+
+#[tokio::test]
+async fn level_cache_broadcast_invalidation_clears_other_instance_l1() {
+    let Some(url) =
+        skip_if_redis_unavailable("level_cache_broadcast_invalidation_clears_other_instance_l1")
+            .await
+    else {
+        return;
+    };
+
+    let scope = unique_scope("cache-invalidation-broadcast");
+    let area = format!("area-{scope}");
+
+    let local_a = local::moka::<String>().max_capacity(128).build().unwrap();
+    let remote_a = remote::redis::<String>()
+        .url(url.clone())
+        .key_prefix(scope.clone())
+        .build()
+        .unwrap();
+
+    let local_b = local::moka::<String>().max_capacity(128).build().unwrap();
+    let remote_b = remote::redis::<String>()
+        .url(url)
+        .key_prefix(scope)
+        .build()
+        .unwrap();
+
+    let cache_a = LevelCacheBuilder::<u64, String>::new()
+        .area(area.clone())
+        .mode(CacheMode::Both)
+        .local(local_a)
+        .remote(remote_a)
+        .broadcast_invalidation(true)
+        .build()
+        .unwrap();
+
+    let cache_b = LevelCacheBuilder::<u64, String>::new()
+        .area(area.clone())
+        .mode(CacheMode::Both)
+        .local(local_b.clone())
+        .remote(remote_b)
+        .broadcast_invalidation(true)
+        .build()
+        .unwrap();
+
+    cache_a
+        .set(&88, Some("broadcast".to_string()))
+        .await
+        .unwrap();
+    let _ = cache_b.get(&88, &ReadOptions::default()).await.unwrap();
+
+    let encoded = format!("{area}:88");
+    let local_before = local_b.get(&encoded).await.unwrap();
+    assert!(local_before.is_some());
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cache_a.del(&88).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let local_after = local_b.get(&encoded).await.unwrap();
+    assert!(local_after.is_none());
+
+    let read_after = cache_b.get(&88, &ReadOptions::default()).await.unwrap();
+    assert_eq!(read_after, None);
+
+    let metrics_b = cache_b.metrics_snapshot();
+    assert!(metrics_b.invalidation_receive >= 1);
+}

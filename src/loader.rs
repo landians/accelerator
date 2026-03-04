@@ -5,24 +5,42 @@ use std::marker::PhantomData;
 
 use crate::error::CacheResult;
 
+/// Single-key data loader abstraction.
+///
+/// Design notes:
+/// - This trait is intentionally async because loader implementations are
+///   usually IO-bound (DB/HTTP/RPC).
+/// - We keep `#[allow(async_fn_in_trait)]` because this crate is currently a
+///   fixed-backend library and does not require `dyn Loader` object safety.
+/// - Returning `Option<V>` allows negative caching semantics:
+///   `Ok(None)` means "query succeeded but row not found".
 #[allow(async_fn_in_trait)]
 pub trait Loader<K, V>: Send + Sync
 where
     K: Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// Loads one key from the source-of-truth backend.
     async fn load(&self, key: &K) -> CacheResult<Option<V>>;
 }
 
+/// Batch loader abstraction built on top of `Loader`.
+///
+/// `mload` must return a map keyed by requested keys, with each value wrapped
+/// in `Option` to preserve not-found semantics per key. Returning a map aligns
+/// better with real-world repository APIs where response order may not match
+/// request order.
 #[allow(async_fn_in_trait)]
 pub trait MLoader<K, V>: Loader<K, V>
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// Loads a batch of keys and returns per-key optional values.
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>>;
 }
 
+/// Built-in no-op loader used when user does not configure a loader.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopLoader;
 
@@ -31,6 +49,7 @@ where
     K: Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// Always returns miss to indicate "loader unavailable".
     async fn load(&self, _key: &K) -> CacheResult<Option<V>> {
         Ok(None)
     }
@@ -41,6 +60,7 @@ where
     K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// Returns an all-miss map for requested keys.
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>> {
         let mut values = HashMap::with_capacity(keys.len());
         for key in keys {
@@ -50,6 +70,7 @@ where
     }
 }
 
+/// Adapter that turns a plain async function/closure into a loader.
 pub struct FnLoader<K, V, F, Fut>
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
@@ -68,6 +89,7 @@ where
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
 {
+    /// Creates a loader from a single-key async function.
     pub fn new(load_fn: F) -> Self {
         Self {
             load_fn,
@@ -83,6 +105,7 @@ where
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
 {
+    /// Delegates to the wrapped single-key async function.
     async fn load(&self, key: &K) -> CacheResult<Option<V>> {
         (self.load_fn)(key.clone()).await
     }
@@ -95,6 +118,7 @@ where
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
 {
+    /// Sequential fallback batch implementation built from single-key loader.
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>> {
         let mut values = HashMap::with_capacity(keys.len());
         for key in keys {

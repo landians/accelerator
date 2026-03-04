@@ -5,6 +5,7 @@ Accelerator is a universal data access acceleration component, designed to enhan
 
 - Runtime is fixed to `moka` (L1) + `redis` (L2).
 - L1 uses `moka`'s built-in eviction behavior; there is no user-facing `EvictionPolicy` switch.
+- Enhanced capabilities are built-in: `warmup`, `refresh_ahead`, `stale_on_error`, and Redis Pub/Sub invalidation broadcast.
 - Production-style usage example: `examples/fixed_backend_best_practice.rs`.
 - Run it with:
 

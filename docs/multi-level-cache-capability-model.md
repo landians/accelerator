@@ -28,6 +28,7 @@
 6. `ttl_jitter_ratio` 已落地（默认 `0.1`），用于错峰过期，降低雪崩风险。
 7. L1 淘汰行为固定为 `moka` 原生策略，不暴露 LRU/LFU/WTinyLFU 切换配置。
 8. 内置基础观测：`LevelCache::metrics_snapshot()` + `tracing` span（`cache.get/mget/set/del/load`）。
+9. 已实现增强能力：`warmup`、`refresh_ahead`、`stale_on_error`、Redis Pub/Sub 失效广播。
 
 ---
 
@@ -126,6 +127,12 @@ pub struct CacheConfig {
     pub cache_null_value: bool,
     pub penetration_protect: bool,
     pub loader_timeout: Option<Duration>,
+    pub warmup_enabled: bool,
+    pub warmup_batch_size: usize,
+    pub refresh_ahead: bool,
+    pub refresh_ahead_window: Duration,
+    pub stale_on_error: bool,
+    pub broadcast_invalidation: bool,
     pub copy_on_read: bool,
     pub copy_on_write: bool,
     pub read_value_mode: ReadValueMode,
@@ -212,6 +219,7 @@ impl<K, V, LD> LevelCache<K, V, LD> {
     pub async fn mset(&self, entries: HashMap<K, Option<V>>) -> CacheResult<()>;
     pub async fn del(&self, key: &K) -> CacheResult<()>;
     pub async fn mdel(&self, keys: &[K]) -> CacheResult<()>;
+    pub async fn warmup(&self, keys: &[K]) -> CacheResult<usize>;
     pub fn metrics_snapshot(&self) -> CacheMetricsSnapshot;
 }
 ```
@@ -228,6 +236,11 @@ pub struct LevelCacheBuilder<K, V, LD = NoopLoader> { /* ... */ }
 2. `mget` 默认返回 `HashMap<K, Option<V>>`，并覆盖所有请求 key。
 3. 回源成功后按 mode 写回（`Local`/`Remote`/`Both`）。
 4. 空值在 `cache_null_value=true` 时按 `null_ttl` 写入。
+5. `warmup_enabled=true` 时，`warmup` 才会执行预热逻辑。
+6. `warmup` 会按 `warmup_batch_size` 分批执行 `mget`，避免单次请求 key 过大。
+7. `refresh_ahead=true` 且命中键接近过期时，会触发回源刷新。
+8. `stale_on_error=true` 且 `ReadOptions.allow_stale=true` 时，加载失败可回退本地旧值。
+9. `broadcast_invalidation=true` 时，`del/mdel` 会通过 Redis Pub/Sub 广播失效并清理其他实例 L1。
 
 ### 5.5.1 singleflight 实现约定（singleflight-async）
 
@@ -377,11 +390,14 @@ pub enum CacheError {
 - `local_max_capacity`（通过 `local::moka::<V>().max_capacity(...)` 配置）
 - `penetration_protect`: bool
 - `loader_timeout_ms`
+- `warmup_enabled`
+- `warmup_batch_size`
+- `refresh_ahead`
+- `refresh_ahead_window_ms`
+- `stale_on_error`
+- `broadcast_invalidation`
 
 后续规划（当前未落地）：
-- `refresh_ahead`: bool
-- `refresh_before_expire_ms`
-- `allow_stale_on_error`
 - `codec`: `Json | Bincode | Custom`
 
 固定约束：
@@ -434,6 +450,10 @@ pub enum CacheError {
 - `local_hit` / `local_miss`
 - `remote_hit` / `remote_miss`
 - `load_total` / `load_success` / `load_timeout` / `load_error`
+- `stale_fallback`
+- `refresh_attempts` / `refresh_success` / `refresh_failures`
+- `invalidation_publish` / `invalidation_publish_failures`
+- `invalidation_receive` / `invalidation_receive_failures`
 
 后续可再对接 Prometheus/OpenTelemetry exporter。
 
@@ -509,10 +529,10 @@ pub enum CacheError {
 
 ### Milestone 2（增强）
 
-- Warm up 预热机制
-- 失效广播
-- refresh ahead
-- 错误分级降级策略
+- [x] Warm up 预热机制
+- [x] 失效广播（Redis Pub/Sub）
+- [x] refresh ahead
+- [x] 错误分级降级策略（stale_on_error）
 
 ### Milestone 3（体验）
 
@@ -570,8 +590,10 @@ cargo run --example fixed_backend_best_practice
 
 1. 显式配置 `mode=Both`，并传入 `moka + redis`。
 2. 开启 `penetration_protect`（singleflight-async）与 `loader_timeout`。
-3. 使用 `loader_fn` 定义最小回源路径。
-4. 通过 `ReadOptions.disable_load` 控制是否允许自动回源。
+3. 结合 `warmup` 在启动阶段预热热点 key。
+4. 需要跨实例 L1 清理时启用 `broadcast_invalidation`。
+5. 可用 `refresh_ahead + stale_on_error` 提升故障期可用性。
+6. 使用 `loader_fn` 定义最小回源路径，并通过 `ReadOptions.disable_load` 控制自动回源。
 
 ### 16.3 Redis 集成测试策略
 

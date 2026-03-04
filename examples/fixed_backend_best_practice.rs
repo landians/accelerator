@@ -6,12 +6,14 @@ use accelerator::config::{CacheMode, ReadValueMode};
 use accelerator::{local, remote};
 use redis::AsyncCommands;
 
+/// Example business payload.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct UserProfile {
     id: u64,
     name: String,
 }
 
+/// Verifies that redis is reachable before running the example.
 async fn redis_ready(url: &str) -> bool {
     let client = match redis::Client::open(url) {
         Ok(client) => client,
@@ -26,6 +28,7 @@ async fn redis_ready(url: &str) -> bool {
     conn.ping::<String>().await.is_ok()
 }
 
+/// Fixed-backend best-practice demo (moka + redis + loader).
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = std::env::var("ACCELERATOR_REDIS_URL")
@@ -56,6 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read_value_mode(ReadValueMode::OwnedClone)
         .penetration_protect(true)
         .loader_timeout(Duration::from_millis(120))
+        .warmup_enabled(true)
+        .warmup_batch_size(128)
+        .refresh_ahead(true)
+        .refresh_ahead_window(Duration::from_secs(5))
+        .stale_on_error(true)
+        .broadcast_invalidation(true)
         .loader_fn(|uid: u64| async move {
             Ok(Some(UserProfile {
                 id: uid,
@@ -63,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }))
         })
         .build()?;
+
+    let warmed = cache.warmup(&[10001, 10002]).await?;
+    println!("warmup loaded={warmed}");
 
     let options = ReadOptions::default();
     let first = cache.get(&10001, &options).await?;

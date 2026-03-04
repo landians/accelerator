@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use singleflight_async::SingleFlight;
 use tokio::time;
+use tokio::time::MissedTickBehavior;
 use tracing::instrument;
 
 use crate::backend::{StoredEntry, StoredValue};
@@ -16,26 +20,56 @@ use crate::error::{CacheError, CacheResult};
 use crate::loader::{MLoader, NoopLoader};
 use crate::{local, remote};
 
+/// Converts business key `K` to encoded storage key suffix.
 pub type KeyConverter<K> = Arc<dyn Fn(&K) -> String + Send + Sync>;
 
+/// Per-request read switches.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReadOptions {
+    /// Allows stale return on load error when `stale_on_error` is enabled.
     pub allow_stale: bool,
+    /// Skips loader even if cache misses.
     pub disable_load: bool,
 }
 
+/// Aggregated runtime metrics snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheMetricsSnapshot {
+    /// Local cache hit count.
     pub local_hit: u64,
+    /// Local cache miss count.
     pub local_miss: u64,
+    /// Remote cache hit count.
     pub remote_hit: u64,
+    /// Remote cache miss count.
     pub remote_miss: u64,
+    /// Total load attempts.
     pub load_total: u64,
+    /// Successful load count.
     pub load_success: u64,
+    /// Timed-out load count.
     pub load_timeout: u64,
+    /// Failed load count.
     pub load_error: u64,
+    /// Returned stale value because fresh load failed.
+    pub stale_fallback: u64,
+    /// Refresh-ahead attempt count.
+    pub refresh_attempts: u64,
+    /// Refresh-ahead success count.
+    pub refresh_success: u64,
+    /// Refresh-ahead failure count.
+    pub refresh_failures: u64,
+    /// Invalidation publish attempts.
+    pub invalidation_publish: u64,
+    /// Invalidation publish failures.
+    pub invalidation_publish_failures: u64,
+    /// Invalidation events applied from subscriber.
+    pub invalidation_receive: u64,
+    /// Invalidation subscribe/consume failures.
+    pub invalidation_receive_failures: u64,
 }
 
+/// Atomic metrics storage used by the cache instance.
 #[derive(Debug, Default)]
 struct CacheMetrics {
     local_hit: AtomicU64,
@@ -46,9 +80,18 @@ struct CacheMetrics {
     load_success: AtomicU64,
     load_timeout: AtomicU64,
     load_error: AtomicU64,
+    stale_fallback: AtomicU64,
+    refresh_attempts: AtomicU64,
+    refresh_success: AtomicU64,
+    refresh_failures: AtomicU64,
+    invalidation_publish: AtomicU64,
+    invalidation_publish_failures: AtomicU64,
+    invalidation_receive: AtomicU64,
+    invalidation_receive_failures: AtomicU64,
 }
 
 impl CacheMetrics {
+    /// Reads all atomic counters into a value snapshot.
     fn snapshot(&self) -> CacheMetricsSnapshot {
         CacheMetricsSnapshot {
             local_hit: self.local_hit.load(Ordering::Relaxed),
@@ -59,23 +102,56 @@ impl CacheMetrics {
             load_success: self.load_success.load(Ordering::Relaxed),
             load_timeout: self.load_timeout.load(Ordering::Relaxed),
             load_error: self.load_error.load(Ordering::Relaxed),
+            stale_fallback: self.stale_fallback.load(Ordering::Relaxed),
+            refresh_attempts: self.refresh_attempts.load(Ordering::Relaxed),
+            refresh_success: self.refresh_success.load(Ordering::Relaxed),
+            refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
+            invalidation_publish: self.invalidation_publish.load(Ordering::Relaxed),
+            invalidation_publish_failures: self
+                .invalidation_publish_failures
+                .load(Ordering::Relaxed),
+            invalidation_receive: self.invalidation_receive.load(Ordering::Relaxed),
+            invalidation_receive_failures: self
+                .invalidation_receive_failures
+                .load(Ordering::Relaxed),
         }
     }
 }
 
+/// Pub/Sub payload used for cross-node local cache invalidation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InvalidationMessage {
+    /// Logical cache area.
+    area: String,
+    /// Encoded keys to invalidate.
+    keys: Vec<String>,
+}
+
+/// Fixed-backend multi-level cache (Moka + Redis).
 pub struct LevelCache<K, V, LD = NoopLoader>
 where
     K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
+    /// Runtime cache configuration.
     pub(crate) config: CacheConfig,
+    /// Local in-memory backend (optional by mode).
     pub(crate) local: Option<local::MokaBackend<V>>,
+    /// Remote redis backend (optional by mode).
     pub(crate) remote: Option<remote::RedisBackend<V>>,
+    /// Source-of-truth loader.
     pub(crate) loader: Option<LD>,
+    /// Business-key encoder.
     pub(crate) key_converter: KeyConverter<K>,
+    /// Singleflight group for miss deduplication.
     singleflight: Arc<SingleFlight<String, CacheResult<Option<V>>>>,
+    /// Runtime metrics.
     metrics: Arc<CacheMetrics>,
+    /// Marks whether invalidation listener has been started.
+    invalidation_listener_started: AtomicBool,
+    /// Join handle for invalidation listener background task.
+    invalidation_listener_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl<K, V, LD> LevelCache<K, V, LD>
@@ -84,6 +160,7 @@ where
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
+    /// Creates a cache instance from builder-wired components.
     pub(crate) fn new(
         config: CacheConfig,
         local: Option<local::MokaBackend<V>>,
@@ -99,22 +176,37 @@ where
             key_converter,
             singleflight: Arc::new(SingleFlight::new()),
             metrics: Arc::new(CacheMetrics::default()),
+            invalidation_listener_started: AtomicBool::new(false),
+            invalidation_listener_task: Mutex::new(None),
         }
     }
 
+    /// Returns cache configuration.
     pub fn config(&self) -> &CacheConfig {
         &self.config
     }
 
+    /// Returns current metrics snapshot.
     pub fn metrics_snapshot(&self) -> CacheMetricsSnapshot {
         self.metrics.snapshot()
     }
 
+    /// Reads one key from cache layers and falls back to loader on miss.
     #[instrument(name = "cache.get", skip_all, fields(area = %self.config.area))]
     pub async fn get(&self, key: &K, options: &ReadOptions) -> CacheResult<Option<V>> {
+        self.ensure_invalidation_listener();
         let encoded_key = self.encoded_key(key);
+        let stale_candidate = self.read_local_stale_value(&encoded_key).await?;
 
-        if let Some(value) = self.read_local_value(&encoded_key).await? {
+        if let Some(local_entry) = self.read_local_value(&encoded_key).await? {
+            let value = Self::entry_to_value(local_entry.clone());
+            self.refresh_ahead_if_needed(
+                key.clone(),
+                encoded_key.clone(),
+                local_entry.expire_at,
+                options,
+            )
+            .await;
             return Ok(value);
         }
 
@@ -129,16 +221,20 @@ where
             return Ok(None);
         }
 
-        let _ = options.allow_stale;
-        self.load_on_miss(key.clone(), encoded_key).await
+        match self.load_on_miss(key.clone(), encoded_key).await {
+            Ok(value) => Ok(value),
+            Err(err) => self.stale_fallback_or_error(err, stale_candidate, options),
+        }
     }
 
+    /// Reads multiple keys and returns a per-key optional value map.
     #[instrument(name = "cache.mget", skip_all, fields(area = %self.config.area, size = keys.len()))]
     pub async fn mget(
         &self,
         keys: &[K],
         options: &ReadOptions,
     ) -> CacheResult<HashMap<K, Option<V>>> {
+        self.ensure_invalidation_listener();
         let mut values = HashMap::with_capacity(keys.len());
         let encoded_pairs = keys
             .iter()
@@ -193,30 +289,40 @@ where
         Ok(values)
     }
 
+    /// Writes one key to active cache layers.
     #[instrument(name = "cache.set", skip_all, fields(area = %self.config.area))]
     pub async fn set(&self, key: &K, value: Option<V>) -> CacheResult<()> {
+        self.ensure_invalidation_listener();
         let encoded_key = self.encoded_key(key);
         self.write_by_mode(&encoded_key, value).await
     }
 
+    /// Writes multiple key/value entries to cache layers.
     #[instrument(name = "cache.mset", skip_all, fields(area = %self.config.area, size = entries.len()))]
     pub async fn mset(&self, entries: HashMap<K, Option<V>>) -> CacheResult<()> {
+        self.ensure_invalidation_listener();
         for (key, value) in entries {
             self.set(&key, value).await?;
         }
         Ok(())
     }
 
+    /// Deletes one key from all active cache layers.
     #[instrument(name = "cache.del", skip_all, fields(area = %self.config.area))]
     pub async fn del(&self, key: &K) -> CacheResult<()> {
+        self.ensure_invalidation_listener();
         let encoded_key = self.encoded_key(key);
         self.delete_remote_if_needed(&encoded_key).await?;
         self.delete_local_if_needed(&encoded_key).await?;
+        self.publish_invalidation_if_needed(vec![encoded_key])
+            .await?;
         Ok(())
     }
 
+    /// Deletes multiple keys from all active cache layers.
     #[instrument(name = "cache.mdel", skip_all, fields(area = %self.config.area, size = keys.len()))]
     pub async fn mdel(&self, keys: &[K]) -> CacheResult<()> {
+        self.ensure_invalidation_listener();
         if keys.is_empty() {
             return Ok(());
         }
@@ -228,22 +334,269 @@ where
 
         self.batch_delete_remote_if_needed(&encoded).await?;
         self.batch_delete_local_if_needed(&encoded).await?;
+        self.publish_invalidation_if_needed(encoded).await?;
         Ok(())
     }
 
+    /// Preloads keys through normal read path in configurable chunks.
+    #[instrument(name = "cache.warmup", skip_all, fields(area = %self.config.area, size = keys.len()))]
+    pub async fn warmup(&self, keys: &[K]) -> CacheResult<usize> {
+        self.ensure_invalidation_listener();
+        if !self.config.warmup_enabled {
+            return Ok(0);
+        }
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let options = ReadOptions {
+            allow_stale: false,
+            disable_load: false,
+        };
+
+        let mut loaded = 0usize;
+        for chunk in keys.chunks(self.config.warmup_batch_size) {
+            let values = self.mget(chunk, &options).await?;
+            loaded += values.values().filter(|value| value.is_some()).count();
+        }
+        Ok(loaded)
+    }
+
+    /// Encodes business key into namespaced storage key.
     fn encoded_key(&self, key: &K) -> String {
         format!("{}:{}", self.config.area, (self.key_converter)(key))
     }
 
+    /// Returns whether local layer is active.
     fn mode_uses_local(&self) -> bool {
         matches!(self.config.mode, CacheMode::Local | CacheMode::Both)
     }
 
+    /// Returns whether remote layer is active.
     fn mode_uses_remote(&self) -> bool {
         matches!(self.config.mode, CacheMode::Remote | CacheMode::Both)
     }
 
-    async fn read_local_value(&self, encoded_key: &str) -> CacheResult<Option<Option<V>>> {
+    /// Builds redis Pub/Sub channel name for invalidation.
+    fn invalidation_channel(&self) -> String {
+        format!("accelerator:invalidation:{}", self.config.area)
+    }
+
+    /// Checks whether invalidation subscriber should run.
+    fn should_start_invalidation_listener(&self) -> bool {
+        self.config.broadcast_invalidation
+            && self.mode_uses_local()
+            && self.mode_uses_remote()
+            && self.local.is_some()
+            && self.remote.is_some()
+    }
+
+    /// Lazily starts the invalidation listener exactly once.
+    fn ensure_invalidation_listener(&self) {
+        if !self.should_start_invalidation_listener() {
+            return;
+        }
+
+        if self.invalidation_listener_started.load(Ordering::Acquire) {
+            return;
+        }
+
+        let Some(local) = self.local.as_ref().cloned() else {
+            return;
+        };
+        let Some(remote) = self.remote.as_ref().cloned() else {
+            return;
+        };
+
+        if self
+            .invalidation_listener_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let channel = self.invalidation_channel();
+        let metrics = self.metrics.clone();
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime.spawn(async move {
+                Self::run_invalidation_listener(local, remote, channel, metrics).await;
+            }),
+            Err(_) => {
+                self.invalidation_listener_started
+                    .store(false, Ordering::Release);
+                return;
+            }
+        };
+
+        let mut slot = self.invalidation_listener_task.lock().unwrap();
+        *slot = Some(handle);
+    }
+
+    /// Runs resilient redis subscription loop and applies local invalidations.
+    async fn run_invalidation_listener(
+        local: local::MokaBackend<V>,
+        remote: remote::RedisBackend<V>,
+        channel: String,
+        metrics: Arc<CacheMetrics>,
+    ) {
+        // Keep retrying so temporary redis failures can self-heal.
+        let mut retry_tick = time::interval(Duration::from_secs(1));
+        retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            let mut pubsub = match remote.subscribe(&channel).await {
+                Ok(pubsub) => pubsub,
+                Err(_) => {
+                    metrics
+                        .invalidation_receive_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    retry_tick.tick().await;
+                    continue;
+                }
+            };
+
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = stream.next().await {
+                let payload = match msg.get_payload::<String>() {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        metrics
+                            .invalidation_receive_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let event: InvalidationMessage = match serde_json::from_str(&payload) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        metrics
+                            .invalidation_receive_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                if event.keys.is_empty() {
+                    continue;
+                }
+
+                if local.mdel(&event.keys).await.is_err() {
+                    metrics
+                        .invalidation_receive_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                metrics.invalidation_receive.fetch_add(1, Ordering::Relaxed);
+            }
+
+            retry_tick.tick().await;
+        }
+    }
+
+    /// Publishes delete invalidation events when configured.
+    async fn publish_invalidation_if_needed(&self, keys: Vec<String>) -> CacheResult<()> {
+        // Skip publish when feature off or no keys to broadcast.
+        if !self.config.broadcast_invalidation || keys.is_empty() {
+            return Ok(());
+        }
+
+        if !self.mode_uses_remote() {
+            return Ok(());
+        }
+
+        let Some(remote) = self.remote.as_ref() else {
+            return Ok(());
+        };
+
+        let payload = serde_json::to_string(&InvalidationMessage {
+            area: self.config.area.clone(),
+            keys,
+        })
+        .map_err(|err| CacheError::Backend(format!("serialize invalidation failed: {err}")))?;
+
+        self.metrics
+            .invalidation_publish
+            .fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = remote.publish(&self.invalidation_channel(), &payload).await {
+            self.metrics
+                .invalidation_publish_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Reads local entry without TTL filtering, used for stale fallback candidate.
+    async fn read_local_stale_value(&self, encoded_key: &str) -> CacheResult<Option<Option<V>>> {
+        if !self.mode_uses_local() {
+            return Ok(None);
+        }
+        let Some(local) = self.local.as_ref() else {
+            return Ok(None);
+        };
+        let Some(entry) = local.peek(encoded_key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::entry_to_value(entry)))
+    }
+
+    /// Returns stale value on eligible errors, otherwise propagates original error.
+    fn stale_fallback_or_error(
+        &self,
+        err: CacheError,
+        stale_candidate: Option<Option<V>>,
+        options: &ReadOptions,
+    ) -> CacheResult<Option<V>> {
+        if !(self.config.stale_on_error && options.allow_stale) {
+            return Err(err);
+        }
+
+        let Some(value) = stale_candidate else {
+            return Err(err);
+        };
+
+        self.metrics.stale_fallback.fetch_add(1, Ordering::Relaxed);
+        Ok(value)
+    }
+
+    /// Triggers refresh-ahead when local value is close to expiration.
+    async fn refresh_ahead_if_needed(
+        &self,
+        key: K,
+        encoded_key: String,
+        expire_at: Instant,
+        options: &ReadOptions,
+    ) {
+        if !self.config.refresh_ahead || options.disable_load || self.loader.is_none() {
+            return;
+        }
+
+        let remain = expire_at.saturating_duration_since(Instant::now());
+        if remain > self.config.refresh_ahead_window {
+            return;
+        }
+
+        self.metrics
+            .refresh_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        match self.load_on_miss(key, encoded_key).await {
+            Ok(_) => {
+                self.metrics.refresh_success.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.metrics
+                    .refresh_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Reads one value from local backend and records hit/miss metrics.
+    async fn read_local_value(&self, encoded_key: &str) -> CacheResult<Option<StoredEntry<V>>> {
         if !self.mode_uses_local() {
             return Ok(None);
         }
@@ -258,9 +611,10 @@ where
         } else {
             self.metrics.local_miss.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(entry.map(Self::entry_to_value))
+        Ok(entry)
     }
 
+    /// Reads one value from remote and backfills local layer when enabled.
     async fn read_remote_value_and_backfill_local(
         &self,
         encoded_key: &str,
@@ -285,6 +639,7 @@ where
         Ok(Some(value))
     }
 
+    /// Backfills local cache only when local mode is active.
     async fn backfill_local_if_needed(
         &self,
         encoded_key: &str,
@@ -296,6 +651,7 @@ where
         self.backfill_local(encoded_key, value).await
     }
 
+    /// Deletes remote key only when remote mode is active.
     async fn delete_remote_if_needed(&self, encoded_key: &str) -> CacheResult<()> {
         if !self.mode_uses_remote() {
             return Ok(());
@@ -308,6 +664,7 @@ where
         remote.del(encoded_key).await
     }
 
+    /// Deletes local key only when local mode is active.
     async fn delete_local_if_needed(&self, encoded_key: &str) -> CacheResult<()> {
         if !self.mode_uses_local() {
             return Ok(());
@@ -320,6 +677,7 @@ where
         local.del(encoded_key).await
     }
 
+    /// Batch deletes remote keys only when remote mode is active.
     async fn batch_delete_remote_if_needed(&self, encoded_keys: &[String]) -> CacheResult<()> {
         if !self.mode_uses_remote() {
             return Ok(());
@@ -332,6 +690,7 @@ where
         remote.mdel(encoded_keys).await
     }
 
+    /// Batch deletes local keys only when local mode is active.
     async fn batch_delete_local_if_needed(&self, encoded_keys: &[String]) -> CacheResult<()> {
         if !self.mode_uses_local() {
             return Ok(());
@@ -344,6 +703,7 @@ where
         local.mdel(encoded_keys).await
     }
 
+    /// Fills result map from local layer and returns remaining misses.
     async fn fill_from_local(
         &self,
         encoded_pairs: &[(K, String)],
@@ -379,6 +739,7 @@ where
         Ok(misses)
     }
 
+    /// Fills misses from remote layer and backfills local for remote hits.
     async fn fill_from_remote_and_backfill_local(
         &self,
         misses: Vec<(K, String)>,
@@ -439,6 +800,7 @@ where
         Ok(remained)
     }
 
+    /// Writes one entry into local cache.
     async fn backfill_local(&self, encoded_key: &str, value: Option<V>) -> CacheResult<()> {
         let Some(local) = self.local.as_ref() else {
             return Ok(());
@@ -452,6 +814,7 @@ where
             .await
     }
 
+    /// Loads value on miss, optionally through singleflight deduplication.
     #[instrument(name = "cache.load", skip_all, fields(area = %self.config.area))]
     async fn load_on_miss(&self, key: K, encoded_key: String) -> CacheResult<Option<V>> {
         if self.loader.is_none() {
@@ -471,6 +834,7 @@ where
             .await
     }
 
+    /// Executes loader with timeout/metrics and writes result back to cache.
     async fn load_and_write(&self, key: &K, encoded_key: &str) -> CacheResult<Option<V>> {
         let loader = self
             .loader
@@ -504,6 +868,7 @@ where
         Ok(loaded)
     }
 
+    /// Writes one key to cache backends according to configured mode.
     async fn write_by_mode(&self, encoded_key: &str, value: Option<V>) -> CacheResult<()> {
         match self.config.mode {
             CacheMode::Local => {
@@ -519,6 +884,7 @@ where
         }
     }
 
+    /// Writes one key into local backend with ttl/null policy.
     async fn write_local(
         local: &Option<local::MokaBackend<V>>,
         config: &CacheConfig,
@@ -547,6 +913,7 @@ where
             .await
     }
 
+    /// Writes one key into remote backend with ttl/null policy.
     async fn write_remote(
         remote: &Option<remote::RedisBackend<V>>,
         config: &CacheConfig,
@@ -575,6 +942,7 @@ where
             .await
     }
 
+    /// Converts stored entry payload into user-facing optional value.
     fn entry_to_value(entry: StoredEntry<V>) -> Option<V> {
         match entry.value {
             StoredValue::Value(value) => Some(value),
@@ -582,6 +950,7 @@ where
         }
     }
 
+    /// Builds a new entry using cache-level ttl and jitter policy.
     fn new_entry(
         &self,
         encoded_key: &str,
@@ -597,6 +966,7 @@ where
         )
     }
 
+    /// Applies deterministic key-based ttl jitter to reduce avalanche risk.
     fn jitter_ttl(encoded_key: &str, base_ttl: Duration, ratio: Option<f64>) -> Duration {
         let Some(ratio) = ratio else {
             return base_ttl;
@@ -623,6 +993,7 @@ where
         Duration::from_millis(capped_ms as u64)
     }
 
+    /// Converts optional value into a stored entry with proper ttl.
     fn to_entry(
         encoded_key: &str,
         value: Option<V>,
@@ -643,6 +1014,20 @@ where
                 None => StoredValue::Null,
             },
             expire_at: Instant::now() + ttl,
+        }
+    }
+}
+
+impl<K, V, LD> Drop for LevelCache<K, V, LD>
+where
+    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+    LD: MLoader<K, V> + Send + Sync + 'static,
+{
+    /// Aborts background invalidation task when cache instance is dropped.
+    fn drop(&mut self) {
+        if let Some(task) = self.invalidation_listener_task.get_mut().unwrap().take() {
+            task.abort();
         }
     }
 }
@@ -920,5 +1305,135 @@ mod tests {
         assert_eq!(metrics.load_total, 1);
         assert_eq!(metrics.load_error, 1);
         assert_eq!(metrics.load_success, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_up_preloads_values_with_loader() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loads_for_loader = loads.clone();
+
+        let cache = test_cache_builder()
+            .warmup_enabled(true)
+            .warmup_batch_size(2)
+            .loader_fn(move |key: u64| {
+                let loads_for_loader = loads_for_loader.clone();
+                async move {
+                    loads_for_loader.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(format!("warm-{key}")))
+                }
+            })
+            .build()
+            .unwrap();
+
+        let loaded = cache.warmup(&[11, 12, 13]).await.unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(loads.load(Ordering::SeqCst), 3);
+
+        let values = cache
+            .mget(&[11, 12, 13], &ReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            values.get(&11).cloned().flatten(),
+            Some("warm-11".to_string())
+        );
+        assert_eq!(
+            values.get(&12).cloned().flatten(),
+            Some("warm-12".to_string())
+        );
+        assert_eq!(
+            values.get(&13).cloned().flatten(),
+            Some("warm-13".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_is_noop_when_disabled() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loads_for_loader = loads.clone();
+
+        let cache = test_cache_builder()
+            .warmup_enabled(false)
+            .loader_fn(move |key: u64| {
+                let loads_for_loader = loads_for_loader.clone();
+                async move {
+                    loads_for_loader.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(format!("warm-{key}")))
+                }
+            })
+            .build()
+            .unwrap();
+
+        let loaded = cache.warmup(&[1, 2, 3]).await.unwrap();
+        assert_eq!(loaded, 0);
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_fallback_returns_last_local_value() {
+        let cache = test_cache_builder()
+            .local_ttl(Duration::from_millis(30))
+            .stale_on_error(true)
+            .loader_fn(|_key: u64| async move {
+                Err(crate::error::CacheError::Loader("db down".to_string()))
+            })
+            .build()
+            .unwrap();
+
+        cache
+            .set(&77, Some("stale-value".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let value = cache
+            .get(
+                &77,
+                &ReadOptions {
+                    allow_stale: true,
+                    disable_load: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, Some("stale-value".to_string()));
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(metrics.stale_fallback, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_ahead_updates_cached_value_before_expire() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loads_for_loader = loads.clone();
+
+        let cache = test_cache_builder()
+            .local_ttl(Duration::from_millis(120))
+            .refresh_ahead(true)
+            .refresh_ahead_window(Duration::from_millis(30))
+            .loader_fn(move |key: u64| {
+                let loads_for_loader = loads_for_loader.clone();
+                async move {
+                    let call = loads_for_loader.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(Some(format!("refreshed-{key}-{call}")))
+                }
+            })
+            .build()
+            .unwrap();
+
+        cache.set(&9, Some("seed".to_string())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(95)).await;
+
+        let first = cache.get(&9, &ReadOptions::default()).await.unwrap();
+        assert_eq!(first, Some("seed".to_string()));
+
+        let second = cache.get(&9, &ReadOptions::default()).await.unwrap();
+        assert_eq!(second, Some("refreshed-9-1".to_string()));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(metrics.refresh_attempts, 1);
+        assert_eq!(metrics.refresh_success, 1);
+        assert_eq!(metrics.refresh_failures, 0);
     }
 }
