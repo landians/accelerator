@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::Hash;
 use std::marker::PhantomData;
 
 use crate::error::CacheResult;
@@ -16,7 +17,7 @@ where
 #[allow(async_fn_in_trait)]
 pub trait MLoader<K, V>: Loader<K, V>
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>>;
@@ -37,7 +38,7 @@ where
 
 impl<K, V> MLoader<K, V> for NoopLoader
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>> {
@@ -51,7 +52,7 @@ where
 
 pub struct FnLoader<K, V, F, Fut>
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
@@ -62,7 +63,7 @@ where
 
 impl<K, V, F, Fut> FnLoader<K, V, F, Fut>
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
@@ -77,7 +78,7 @@ where
 
 impl<K, V, F, Fut> Loader<K, V> for FnLoader<K, V, F, Fut>
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
@@ -89,7 +90,7 @@ where
 
 impl<K, V, F, Fut> MLoader<K, V> for FnLoader<K, V, F, Fut>
 where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     F: Fn(K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,

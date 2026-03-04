@@ -509,6 +509,7 @@ pub enum CacheError {
 
 ### Milestone 2（增强）
 
+- Warm up 预热机制
 - 失效广播
 - refresh ahead
 - 错误分级降级策略

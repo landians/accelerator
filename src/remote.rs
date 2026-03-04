@@ -9,6 +9,11 @@ use serde::de::DeserializeOwned;
 use crate::backend::{StoredEntry, StoredValue};
 use crate::error::{CacheError, CacheResult};
 
+// Redis GET/MGET responses do not include per-key TTL metadata.
+// This placeholder keeps StoredEntry non-expired for value transport only.
+// Real expiration remains enforced by Redis through PSETEX at write time.
+const REDIS_READ_PLACEHOLDER_TTL: Duration = Duration::from_secs(3600);
+
 #[derive(Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "value")]
 enum RedisStoredValue<V> {
@@ -96,7 +101,7 @@ where
         let value = Self::from_payload(&raw)?;
         Ok(Some(StoredEntry {
             value,
-            expire_at: Instant::now() + Duration::from_secs(3600),
+            expire_at: Instant::now() + REDIS_READ_PLACEHOLDER_TTL,
         }))
     }
 
@@ -120,7 +125,7 @@ where
             let entry = match raw_values.get(idx).cloned().flatten() {
                 Some(raw) => Some(StoredEntry {
                     value: Self::from_payload(&raw)?,
-                    expire_at: Instant::now() + Duration::from_secs(3600),
+                    expire_at: Instant::now() + REDIS_READ_PLACEHOLDER_TTL,
                 }),
                 None => None,
             };
