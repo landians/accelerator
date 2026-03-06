@@ -130,7 +130,7 @@ struct InvalidationMessage {
 /// Fixed-backend multi-level cache (Moka + Redis).
 pub struct LevelCache<K, V, LD = NoopLoader>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
@@ -156,7 +156,7 @@ where
 
 impl<K, V, LD> LevelCache<K, V, LD>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
@@ -1020,7 +1020,7 @@ where
 
 impl<K, V, LD> Drop for LevelCache<K, V, LD>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {

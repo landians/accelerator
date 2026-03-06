@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use crate::{local, remote};
 /// Builder for fixed-backend `LevelCache` instances.
 pub struct LevelCacheBuilder<K, V, LD = NoopLoader>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
@@ -29,7 +30,7 @@ where
 
 impl<K, V, LD> Default for LevelCacheBuilder<K, V, LD>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
@@ -48,7 +49,7 @@ where
 
 impl<K, V> LevelCacheBuilder<K, V>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     /// Creates a builder with default local(moka) + remote(redis) backends.
@@ -61,7 +62,7 @@ where
 
 impl<K, V, LD> LevelCacheBuilder<K, V, LD>
 where
-    K: Clone + Eq + std::hash::Hash + ToString + Send + Sync + 'static,
+    K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
 {
