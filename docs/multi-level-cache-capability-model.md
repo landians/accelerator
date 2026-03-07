@@ -133,8 +133,6 @@ pub struct CacheConfig {
     pub refresh_ahead_window: Duration,
     pub stale_on_error: bool,
     pub broadcast_invalidation: bool,
-    pub copy_on_read: bool,
-    pub copy_on_write: bool,
     pub read_value_mode: ReadValueMode,
 }
 ```
@@ -145,16 +143,16 @@ pub struct CacheConfig {
 - `StoredValue::Null` 表示“明确缓存空结果”，和 miss 语义不同。
 - `ReadOptions.disable_load=true` 时，`get/mget` 必须严格 cache-only。
 
-### 5.3 值所有权与复制语义（copy-on-read / copy-on-write）
+### 5.3 值所有权与复制语义
 
 > 结论：Rust 仍然需要显式建模 copy 语义。  
 > `Send + Sync` 解决的是并发安全，不等于业务快照隔离。
 
 语义约束：
 
-1. **copy-on-read=true（默认）**：返回值与缓存内部状态隔离。
-2. **copy-on-write=true（默认）**：写入时获取独立所有权，避免外部后续修改影响缓存。
-3. **SharedArc 模式（可选）**：用于只读大对象优化；若值包含 interior mutability，需由业务自行保证语义正确。
+1. **OwnedClone（当前默认）**：读路径返回拥有权值，和缓存内部状态隔离。
+2. **SharedArc（预留）**：用于只读大对象优化；若值包含 interior mutability，需由业务自行保证语义正确。
+3. 当前版本不再暴露 `copy_on_read/copy_on_write` 开关，避免“配置存在但主流程未生效”的误导。
 
 ### 5.4 固定后端接口（不再抽象 trait）
 
@@ -358,6 +356,36 @@ pub enum CacheError {
 2. 广播失效消息。
 3. 其他实例收到后删除各自 L1。
 
+### 7.3.1 Redis Pub/Sub 失效广播时序图（A 删除 -> B 清 L1）
+
+```mermaid
+sequenceDiagram
+    participant Client as 业务请求
+    participant A as 实例A(LevelCache)
+    participant Redis as Redis(Pub/Sub)
+    participant B as 实例B(LevelCache)
+    participant BLocal as 实例B本地L1(moka)
+
+    Note over A,B: 两个实例使用相同 area，并开启 broadcast_invalidation=true
+    Note over B: B 已在读写路径触发 ensure_invalidation_listener()，后台订阅 channel=accelerator:invalidation:{area}
+
+    Client->>A: del(key)
+    A->>A: delete_remote_if_needed(encoded_key)
+    A->>A: delete_local_if_needed(encoded_key)
+    A->>Redis: PUBLISH InvalidationMessage{area, keys:[encoded_key]}
+    Redis-->>B: 推送失效消息
+    B->>B: run_invalidation_listener 解析 payload
+    B->>BLocal: mdel(keys)
+    B-->>Redis: 持续订阅等待下一条消息
+```
+
+补充说明：
+
+1. 监听器不是构造时启动，而是在 `get/mget/set/mset/del/mdel/warmup` 入口懒启动（`ensure_invalidation_listener`）。
+2. 广播消息体为 `InvalidationMessage { area, keys }`，频道名为 `accelerator:invalidation:{area}`。
+3. 监听循环具备重试自愈能力：订阅失败/反序列化失败/本地删除失败会记录失败指标并继续重试。
+4. 当前语义是“应用删除驱动的失效广播”，不包含 Redis Keyspace Notification 的自然过期事件广播。
+
 ---
 
 ## 8. 一致性策略模型
@@ -385,7 +413,6 @@ pub enum CacheError {
 - `area`: 业务命名空间
 - `local_ttl`, `remote_ttl`, `null_ttl`
 - `ttl_jitter_ratio`（当前已实现，默认 `Some(0.1)`，范围 `[0.0, 1.0]`）
-- `copy_on_read`, `copy_on_write`
 - `read_value_mode`: `OwnedClone | SharedArc`
 - `local_max_capacity`（通过 `local::moka::<V>().max_capacity(...)` 配置）
 - `penetration_protect`: bool
@@ -415,8 +442,6 @@ pub enum CacheError {
 
 建议默认配置：
 
-- `copy_on_read=true`
-- `copy_on_write=true`
 - `read_value_mode=OwnedClone`
 
 当业务明确是“大对象只读模型”时，可切换 `read_value_mode=SharedArc` 以减少拷贝开销，但必须满足：

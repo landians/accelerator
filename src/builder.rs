@@ -185,18 +185,6 @@ where
         self
     }
 
-    /// Sets copy-on-read switch.
-    pub fn copy_on_read(mut self, enabled: bool) -> Self {
-        self.config.copy_on_read = enabled;
-        self
-    }
-
-    /// Sets copy-on-write switch.
-    pub fn copy_on_write(mut self, enabled: bool) -> Self {
-        self.config.copy_on_write = enabled;
-        self
-    }
-
     /// Selects read value mode strategy.
     pub fn read_value_mode(mut self, mode: ReadValueMode) -> Self {
         self.config.read_value_mode = mode;

@@ -54,8 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .local_ttl(Duration::from_secs(60))
         .remote_ttl(Duration::from_secs(300))
         .null_ttl(Duration::from_secs(30))
-        .copy_on_read(true)
-        .copy_on_write(true)
         .read_value_mode(ReadValueMode::OwnedClone)
         .penetration_protect(true)
         .loader_timeout(Duration::from_millis(120))

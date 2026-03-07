@@ -199,14 +199,10 @@ where
         let stale_candidate = self.read_local_stale_value(&encoded_key).await?;
 
         if let Some(local_entry) = self.read_local_value(&encoded_key).await? {
-            let value = Self::entry_to_value(local_entry.clone());
-            self.refresh_ahead_if_needed(
-                key.clone(),
-                encoded_key.clone(),
-                local_entry.expire_at,
-                options,
-            )
-            .await;
+            let expire_at = local_entry.expire_at;
+            let value = Self::entry_to_value(local_entry);
+            self.refresh_ahead_if_needed(key, &encoded_key, expire_at, options)
+                .await;
             return Ok(value);
         }
 
@@ -221,7 +217,7 @@ where
             return Ok(None);
         }
 
-        match self.load_on_miss(key.clone(), encoded_key).await {
+        match self.load_on_miss(key, &encoded_key).await {
             Ok(value) => Ok(value),
             Err(err) => self.stale_fallback_or_error(err, stale_candidate, options),
         }
@@ -241,7 +237,7 @@ where
             .map(|key| (key.clone(), self.encoded_key(key)))
             .collect::<Vec<_>>();
 
-        let mut misses = self.fill_from_local(&encoded_pairs, &mut values).await?;
+        let mut misses = self.fill_from_local(encoded_pairs, &mut values).await?;
         misses = self
             .fill_from_remote_and_backfill_local(misses, &mut values)
             .await?;
@@ -255,7 +251,7 @@ where
 
         if self.config.penetration_protect {
             for (key, encoded_key) in misses {
-                let value = self.load_on_miss(key.clone(), encoded_key).await?;
+                let value = self.load_on_miss(&key, &encoded_key).await?;
                 values.insert(key, value);
             }
             return Ok(values);
@@ -266,10 +262,7 @@ where
             .as_ref()
             .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
 
-        let request_keys = misses
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
+        let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
 
         let loaded_map = if let Some(timeout) = self.config.loader_timeout {
             match time::timeout(timeout, loader.mload(&request_keys)).await {
@@ -280,7 +273,7 @@ where
             loader.mload(&request_keys).await
         }?;
 
-        for (key, encoded_key) in misses {
+        for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
             let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
             self.write_by_mode(&encoded_key, loaded.clone()).await?;
             values.insert(key, loaded);
@@ -566,8 +559,8 @@ where
     /// Triggers refresh-ahead when local value is close to expiration.
     async fn refresh_ahead_if_needed(
         &self,
-        key: K,
-        encoded_key: String,
+        key: &K,
+        encoded_key: &str,
         expire_at: Instant,
         options: &ReadOptions,
     ) {
@@ -706,15 +699,15 @@ where
     /// Fills result map from local layer and returns remaining misses.
     async fn fill_from_local(
         &self,
-        encoded_pairs: &[(K, String)],
+        encoded_pairs: Vec<(K, String)>,
         values: &mut HashMap<K, Option<V>>,
     ) -> CacheResult<Vec<(K, String)>> {
         if !self.mode_uses_local() {
-            return Ok(encoded_pairs.to_vec());
+            return Ok(encoded_pairs);
         }
 
         let Some(local) = self.local.as_ref() else {
-            return Ok(encoded_pairs.to_vec());
+            return Ok(encoded_pairs);
         };
         let keys = encoded_pairs
             .iter()
@@ -724,14 +717,14 @@ where
 
         let mut misses = Vec::new();
         for (key, encoded_key) in encoded_pairs {
-            match local_values.get(encoded_key).cloned().flatten() {
+            match local_values.get(&encoded_key).cloned().flatten() {
                 Some(entry) => {
                     self.metrics.local_hit.fetch_add(1, Ordering::Relaxed);
-                    values.insert(key.clone(), Self::entry_to_value(entry));
+                    values.insert(key, Self::entry_to_value(entry));
                 }
                 None => {
                     self.metrics.local_miss.fetch_add(1, Ordering::Relaxed);
-                    misses.push((key.clone(), encoded_key.clone()));
+                    misses.push((key, encoded_key));
                 }
             }
         }
@@ -816,7 +809,7 @@ where
 
     /// Loads value on miss, optionally through singleflight deduplication.
     #[instrument(name = "cache.load", skip_all, fields(area = %self.config.area))]
-    async fn load_on_miss(&self, key: K, encoded_key: String) -> CacheResult<Option<V>> {
+    async fn load_on_miss(&self, key: &K, encoded_key: &str) -> CacheResult<Option<V>> {
         if self.loader.is_none() {
             return Err(CacheError::InvalidConfig(
                 "loader is not configured".to_string(),
@@ -824,12 +817,12 @@ where
         }
 
         if !self.config.penetration_protect {
-            return self.load_and_write(&key, &encoded_key).await;
+            return self.load_and_write(key, encoded_key).await;
         }
 
         self.singleflight
-            .work(encoded_key.clone(), || async {
-                self.load_and_write(&key, &encoded_key).await
+            .work(encoded_key.to_string(), || async {
+                self.load_and_write(key, encoded_key).await
             })
             .await
     }

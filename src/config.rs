@@ -53,10 +53,6 @@ pub struct CacheConfig {
     pub stale_on_error: bool,
     /// Publishes invalidation events via Redis Pub/Sub on delete paths.
     pub broadcast_invalidation: bool,
-    /// Copy-on-read switch (reserved for future advanced value modes).
-    pub copy_on_read: bool,
-    /// Copy-on-write switch (reserved for future advanced value modes).
-    pub copy_on_write: bool,
     /// Read value mode strategy.
     pub read_value_mode: ReadValueMode,
 }
@@ -80,8 +76,6 @@ impl Default for CacheConfig {
             refresh_ahead_window: Duration::from_secs(3),
             stale_on_error: false,
             broadcast_invalidation: false,
-            copy_on_read: true,
-            copy_on_write: true,
             read_value_mode: ReadValueMode::OwnedClone,
         }
     }
