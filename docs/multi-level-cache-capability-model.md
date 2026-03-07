@@ -561,9 +561,9 @@ sequenceDiagram
 
 ### Milestone 3（体验）
 
-- 宏注解 API
-- 批量接口
-- 治理/观测控制面
+- [x] 宏注解 API（V1 单 key：`cacheable/cache_put/cache_evict`）
+- [x] 批量接口（`mget/mset/mdel` 已落地）
+- [ ] 治理/观测控制面
 
 ---
 
@@ -640,5 +640,413 @@ cargo test
 
 ### 16.4 当前版本边界说明
 
-- 过程宏（如 `#[cached]`）尚未落地，不属于当前 MVP 对外承诺。
-- 若后续需要过程宏，会以“对 `LevelCache` 的语法糖包装”方式引入，不改变固定后端主路径。
+- 过程宏 V2 已落地，当前支持单 key + 批量注解：`cacheable` / `cache_put` / `cache_evict` / `cacheable_batch` / `cache_evict_batch`。
+- 宏参数校验与签名报错已增强，覆盖 `async method`、重复参数、未知参数、`on_cache_error` 取值等常见误用。
+- `listener/tag` 风格注解尚未实现，仍作为后续增强项。
+
+---
+
+## 17. 过程宏方案（HyPerf 风格，V2 已实现）
+
+本节给出“完整可落地”的宏方案草案，用于提升业务代码体验。  
+设计目标是参考 HyPerf 的意图分层（`Cacheable/Put/Evict`），但采用 Rust 编译期展开与类型检查语义。
+
+### 17.1 设计目标
+
+1. 保持现有公共 API 不变：`get/set/del/mget/mset/mdel` 仍是唯一运行时标准接口。
+2. 宏仅做“语法糖包装”，不复制缓存引擎逻辑。
+3. 使用 Rust 表达式生成 key/value，不引入 SpEL/字符串 DSL。
+4. 单 key 与批量路径都通过过程宏统一，业务只保留查询/写入核心逻辑。
+5. 与现有能力对齐：singleflight、ttl-jitter、refresh-ahead、stale-on-error、广播失效均继续由 `LevelCache` 配置生效。
+
+### 17.2 宏列表与分阶段范围
+
+V1（首批）：
+
+1. `#[cacheable(...)]`：读缓存，miss 执行函数并回填。
+2. `#[cache_put(...)]`：执行业务后写缓存。
+3. `#[cache_evict(...)]`：执行业务后删缓存（可选 before）。
+
+V2（增强）：
+
+1. `#[cacheable_batch(...)]`：批量读取包装（内部调用 `mget/mset`）。（已实现）
+2. `#[cache_evict_batch(...)]`：批量失效包装（内部调用 `mdel`）。（已实现）
+3. `listener/tag` 风格失效主题（映射到广播通道）。（待实现）
+
+### 17.3 Key 构建契约（必须统一）
+
+宏层与内核层采用“两段式 key”：
+
+1. **宏层生成业务 key（`K`）**：由 `key = ...` Rust 表达式产生。
+2. **内核层生成最终缓存 key（`CacheKey`）**：`LevelCache` 统一执行 `area + ":" + key_converter(K)`。
+
+约束：
+
+1. 宏层不得自行拼接最终 `area` 前缀，避免与 `LevelCache::encoded_key` 语义冲突。
+2. 业务若需要额外维度（如 tenant/version），在 `key` 表达式中编码到 `K` 或 `key_converter` 中。
+3. 文档与示例都应明确“宏 key 不是最终 Redis key”。
+
+### 17.4 V1 宏参数草案
+
+#### 17.4.1 `#[cacheable(...)]`
+
+```rust
+#[cacheable(
+    cache = self.user_cache,
+    key = user_id,
+    allow_stale = false,
+    cache_none = true,
+    on_cache_error = "ignore"
+)]
+```
+
+参数说明：
+
+1. `cache`：缓存实例表达式（需支持 `get/set`）。
+2. `key`：业务 key 表达式（类型匹配 `K`）。
+3. `allow_stale`：映射 `ReadOptions.allow_stale`（默认 `false`）。
+4. `cache_none`：函数返回 `None` 时是否写空值缓存（默认 `true`）。
+5. `on_cache_error`：`"ignore"` 或 `"propagate"`（默认 `"ignore"`）。
+
+#### 17.4.2 `#[cache_put(...)]`
+
+```rust
+#[cache_put(
+    cache = self.user_cache,
+    key = user.id,
+    value = Some(user.clone()),
+    on_cache_error = "ignore"
+)]
+```
+
+参数说明：
+
+1. `cache`：缓存实例表达式（需支持 `set`）。
+2. `key`：业务 key 表达式。
+3. `value`：写缓存值表达式（类型匹配 `Option<V>`）。
+4. `on_cache_error`：`"ignore"` 或 `"propagate"`（默认 `"ignore"`）。
+
+#### 17.4.3 `#[cache_evict(...)]`
+
+```rust
+#[cache_evict(
+    cache = self.user_cache,
+    key = user_id,
+    before = false,
+    on_cache_error = "ignore"
+)]
+```
+
+参数说明：
+
+1. `cache`：缓存实例表达式（需支持 `del`）。
+2. `key`：业务 key 表达式。
+3. `before`：是否在执行业务前删除缓存（默认 `false`，推荐后删）。
+4. `on_cache_error`：`"ignore"` 或 `"propagate"`（默认 `"ignore"`）。
+
+#### 17.4.4 `#[cacheable_batch(...)]`
+
+```rust
+#[cacheable_batch(
+    cache = self.user_cache,
+    keys = user_ids,
+    allow_stale = false,
+    on_cache_error = "ignore"
+)]
+```
+
+参数说明：
+
+1. `cache`：缓存实例表达式（需支持 `mget/mset`）。
+2. `keys`：批量 key 表达式（建议直接使用方法参数标识符）。
+3. `allow_stale`：映射到 `ReadOptions.allow_stale`（默认 `false`）。
+4. `on_cache_error`：`"ignore"` 或 `"propagate"`（默认 `"ignore"`）。
+
+#### 17.4.5 `#[cache_evict_batch(...)]`
+
+```rust
+#[cache_evict_batch(
+    cache = self.user_cache,
+    keys = user_ids,
+    before = false,
+    on_cache_error = "ignore"
+)]
+```
+
+参数说明：
+
+1. `cache`：缓存实例表达式（需支持 `mdel`）。
+2. `keys`：批量 key 表达式。
+3. `before`：是否在执行业务前先批量失效（默认 `false`）。
+4. `on_cache_error`：`"ignore"` 或 `"propagate"`（默认 `"ignore"`）。
+
+### 17.5 宏展开语义（V1 + V2）
+
+#### 17.5.1 `cacheable`
+
+1. 先执行 `cache.get(key, ReadOptions { disable_load: true, allow_stale })`。
+2. 命中直接返回。
+3. miss 时执行业务函数体（等价“手写回源”）。
+4. 业务返回成功后：
+   - `Some(v)` -> `cache.set(key, Some(v.clone()))`
+   - `None` 且 `cache_none=true` -> `cache.set(key, None)`
+5. 返回业务函数原始结果。
+
+#### 17.5.2 `cache_put`
+
+1. 执行业务函数体。
+2. 成功后执行 `cache.set(key, value)`。
+3. 返回业务函数原始结果。
+
+#### 17.5.3 `cache_evict`
+
+1. `before=true`：先 `cache.del(key)`，再执行业务函数。
+2. `before=false`：先执行业务函数，成功后 `cache.del(key)`。
+3. 返回业务函数原始结果。
+
+#### 17.5.4 `cacheable_batch`
+
+1. 先对 `keys` 去重（按 `HashMap` 语义去重）。
+2. 执行 `cache.mget(keys, ReadOptions { disable_load: true, allow_stale })`。
+3. 把值为 `None` 的 key 视作 misses；命中值直接保留。
+4. 仅将 misses 传递给业务函数体（当 `keys` 是方法参数标识符且类型为 `Vec<K>` / `&[K]` / `&Vec<K>` 时自动重绑）。
+5. 业务函数成功后，将 misses 的结果回写 `cache.mset(...)`，并返回完整 `HashMap<K, Option<V>>`。
+
+#### 17.5.5 `cache_evict_batch`
+
+1. 先对 `keys` 去重。
+2. `before=true`：先 `cache.mdel(&keys)`，再执行业务函数。
+3. `before=false`：先执行业务函数，成功后 `cache.mdel(&keys)`。
+4. 返回业务函数原始结果。
+
+### 17.6 类型与签名约束（V2）
+
+1. 仅支持 `async fn`。
+2. 仅支持方法场景（含 `&self` / `&mut self`），free fn 放到后续版本。
+3. 仅接受“result-like”返回类型（例如 `Result<T, E>`、`CacheResult<T>`、`MacroTestResult<T>`）。
+4. `cacheable` 要求 Ok 类型为 `Option<V>`；`cacheable_batch` 要求 Ok 类型为 `HashMap<K, Option<V>>`。
+5. `cache_put/cache_evict/cache_evict_batch` 对 Ok 类型不做额外限制。
+6. `cacheable_batch` 在“misses 自动重绑”场景下，`keys` 参数类型需为 `Vec<K>` / `&[K]` / `&Vec<K>`。
+7. 若签名不匹配，宏在编译期报错，优先给出“可执行修改建议”（例如改为 `async fn ...(&self, ...)`）。
+8. 当 `on_cache_error="propagate"` 时，返回错误类型需满足 `From<CacheError>`。
+
+### 17.7 批量宏（V2）当前语义
+
+1. `cacheable_batch` 与 `cache_evict_batch` 都会先对输入 key 去重（按 `HashMap` 语义）。
+2. `cacheable_batch` 默认返回覆盖请求 key 的 `HashMap<K, Option<V>>`，并在 miss 后批量 `mset` 回写。
+3. misses 判断基于 `mget(disable_load=true)` 返回中的 `None` 值。
+4. 业务函数返回缺失 key 时，宏会按 `None` 合并并回写，保证返回结构完整。
+
+### 17.8 错误语义与可观测
+
+1. 默认 `on_cache_error="ignore"`：缓存异常不阻断业务主链路（fail-open）。
+2. 可选 `on_cache_error="propagate"`：缓存异常直接返回错误。
+3. 宏展开路径统一输出 `tracing` 字段：`cache_macro`, `op`, `result`, `error`。
+4. `result` 当前固定为 `ignored`/`propagated`，便于在日志平台快速聚合缓存异常处理策略。
+5. 与 `metrics_snapshot()` 配合，保证可定位“业务失败”与“缓存失败”的边界。
+
+### 17.9 crate 组织建议
+
+1. 对外统一使用 `accelerator::macros` 命名空间，不要求业务方直接依赖额外 crate。
+2. 实现上在 workspace 内保留内部 `macros/` proc-macro 子包，并由主 crate 进行 re-export：
+
+```rust
+pub mod macros {
+    pub use macros_impl::{cache_evict, cache_evict_batch, cache_put, cacheable, cacheable_batch};
+}
+```
+
+3. 业务侧期望导入方式：
+
+```rust
+use accelerator::macros::{cache_evict, cache_evict_batch, cache_put, cacheable, cacheable_batch};
+```
+
+4. 生成代码仅依赖 `accelerator` 公共 API，不访问内部私有实现。
+
+### 17.10 最小示例（V1 目标形态）
+
+```rust
+use accelerator::macros::{cache_evict, cacheable};
+use accelerator::CacheResult;
+
+impl UserService {
+    #[cacheable(cache = self.user_cache, key = user_id)]
+    async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
+        self.repo.find_user(user_id).await
+    }
+
+    #[cache_evict(cache = self.user_cache, key = user_id)]
+    async fn delete_user(&self, user_id: u64) -> CacheResult<()> {
+        self.repo.delete_user(user_id).await
+    }
+}
+```
+
+该示例的目标是把“缓存模板代码”从业务方法中剥离，同时保持行为可预测、可测试、可观测。
+
+### 17.11 宏展开前后对照（V1.1）
+
+业务写法（宏前）：
+
+```rust
+async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
+    let opts = ReadOptions { allow_stale: false, disable_load: true };
+    if let Some(hit) = self.cache.get(&user_id, &opts).await? {
+        return Ok(Some(hit));
+    }
+
+    let loaded = self.repo.find_by_id(user_id).await?;
+    if let Some(v) = loaded.as_ref() {
+        self.cache.set(&user_id, Some(v.clone())).await?;
+    }
+    Ok(loaded)
+}
+```
+
+宏写法（宏后）：
+
+```rust
+#[cacheable(cache = self.cache, key = user_id, on_cache_error = "ignore")]
+async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
+    self.repo.find_by_id(user_id).await
+}
+```
+
+推荐直接参考可运行示例：`examples/macro_best_practice.rs`。
+
+### 17.12 批量宏示例（V2）
+
+批量宏完整示例见：`examples/macro_batch_best_practice.rs`。
+
+该示例覆盖：
+
+1. `#[cacheable_batch]`：`mget` + misses 回源 + `mset` 回写。
+2. `#[cache_evict_batch]`：批量删除后统一失效。
+3. 重复 key 去重后的返回语义（`HashMap<K, Option<V>>`）。
+
+---
+
+## 18. 后续计划（详细 Roadmap）
+
+本节给出 V1 之后的详细实施计划，目标是把“可用”推进到“可规模化落地”。
+
+### 18.1 迭代 A：宏 V1.1 稳定化（短期）
+
+目标：提升宏的可用性与可诊断性，不改变核心运行时语义。
+
+交付项：
+
+1. **签名检查增强**：对 `async fn`、返回类型、参数类型给出更清晰的编译期报错。
+2. **参数校验增强**：完善 `cache/key/value/on_cache_error/before` 的错误提示与示例建议。
+3. **测试矩阵扩展**：
+   - `on_cache_error=ignore/propagate` 双路径测试
+   - `cache_none=true/false` 行为测试
+   - `before=true/false` + 业务失败/成功组合测试
+4. **文档与示例补齐**：
+   - 增加 `examples/macro_best_practice.rs`
+   - 补充“宏展开前后对照示例”
+5. **可观测增强**：宏展开路径补充统一 `tracing` 字段约定。
+
+验收标准：
+
+1. `cargo test` 全绿，宏测试覆盖率显著提升（重点分支全部覆盖）。
+2. 常见误用（参数拼错/签名错误）能够在编译期直接定位。
+3. 宏示例可直接运行，并与手写缓存代码语义一致。
+
+当前状态（2026-03-07）：
+
+1. [x] 签名/参数校验增强已落地（`macros/src/lib.rs`）。
+2. [x] 宏测试矩阵已补齐并拆分到独立模块（`tests/macro_v1/*.rs`）。
+3. [x] 过程宏最佳实践示例已补充（`examples/macro_best_practice.rs`）。
+4. [x] 宏路径日志字段已统一为 `cache_macro/op/result/error`。
+
+### 18.2 迭代 B：批量宏 V2（中期）
+
+目标：补齐批量场景宏能力，同时保持现有 `HashMap<K, Option<V>>` 语义不变。
+
+交付项：
+
+1. 新增 `#[cacheable_batch(...)]`：
+   - 先 `mget(disable_load=true)`，再对 misses 执行业务批量回源
+   - 回写后返回覆盖全部请求 key 的 `HashMap<K, Option<V>>`
+2. 新增 `#[cache_evict_batch(...)]`：
+   - 由 `keys=...` 产出 `Vec<K>`，统一调用 `mdel(&keys)`
+3. 明确重复 key 语义：
+   - 默认按 `HashMap` 语义去重
+   - 文档中明确“重复 key 不保证重复返回”
+4. 批量路径测试扩展：
+   - 大批量 misses/hits 混合
+   - 重复 key
+   - 空输入
+   - 部分回源失败
+
+验收标准：
+
+1. 批量宏在语义上与手写 `mget/mset/mdel` 主流程一致。
+2. 性能开销可控（与手写实现相比不出现数量级退化）。
+3. 文档中明确边界条件与重复 key 行为。
+
+当前状态（2026-03-07）：
+
+1. [x] `cacheable_batch` 已实现（`mget` -> miss 合并 -> `mset`）。
+2. [x] `cache_evict_batch` 已实现（支持 `before=true/false`）。
+3. [x] 重复 key 已按 `HashMap` 语义去重。
+4. [x] 批量测试矩阵已补齐（`tests/macro_v2/*.rs`）。
+5. [x] 批量最佳实践示例已补充（`examples/macro_batch_best_practice.rs`）。
+
+### 18.3 迭代 C：治理与观测控制面（中期）
+
+目标：让组件从“库可用”走向“线上可治理”。
+
+交付项：
+
+1. 指标出口能力（Prometheus/OpenTelemetry 适配）：
+   - 将 `metrics_snapshot` 结构化映射为稳定指标命名
+2. 关键事件日志标准化：
+   - 统一字段：`area/op/key_hash/result/latency_ms/error_kind`
+3. 运行时诊断接口（只读）：
+   - 当前配置快照
+   - 关键计数器快照
+4. 运维手册：
+   - Redis 不可达、广播异常、回源超时的排障路径
+
+验收标准：
+
+1. 故障注入场景下可通过指标+日志快速定位根因。
+2. 线上排障文档可覆盖 80% 常见问题路径。
+
+### 18.4 迭代 D：性能与工程化收敛（中长期）
+
+目标：将宏能力与核心缓存路径在性能与工程规范上长期稳定化。
+
+交付项：
+
+1. 基准测试（`criterion`）：
+   - 手写路径 vs 宏路径（单 key / 批量）
+   - 本地命中 / 远端命中 / miss 回源 三种场景
+2. 回归门禁：
+   - 为关键 benchmark 设回归阈值
+3. API 稳定策略：
+   - 宏参数向后兼容规则
+   - 破坏性修改的迁移说明模板
+4. 示例工程：
+   - 提供一套“推荐项目结构 + 宏使用模板”
+
+验收标准：
+
+1. 宏路径性能与手写路径差距在可接受范围内（有量化结论）。
+2. 每次发布具备可追踪的兼容性说明与迁移指导。
+
+### 18.5 执行顺序建议
+
+1. 已完成 **迭代 A（V1.1 稳定化）** 与 **迭代 B（批量宏 V2）**。
+2. 下一步优先推进 **迭代 C（治理与观测控制面）**，先补齐指标与日志标准化。
+3. 性能基准与门禁建议从当前版本开始持续执行（可与迭代 C 并行）。
+
+### 18.6 风险与回退策略
+
+1. **宏误判签名风险**：通过 compile-fail 测试与错误信息模板化降低风险。
+2. **批量语义歧义风险**：固定默认 `HashMap` 语义并在文档中明确重复 key 行为。
+3. **性能回退风险**：引入 benchmark 基线与 CI 阈值告警。
+4. **线上行为不可见风险**：优先建设可观测能力，再扩大宏覆盖面。

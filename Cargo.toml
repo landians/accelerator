@@ -6,12 +6,13 @@ license = "MIT"
 description = "MVP multi-level cache runtime with singleflight load de-duplication"
 
 [dependencies]
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12.14", features = ["future"] }
 redis = { version = "0.32", features = ["aio", "tokio-comp"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 singleflight-async = "0.2"
 thiserror = "2"
 tokio = { version = "1.50.0", features = ["sync", "time", "rt-multi-thread", "macros"] }
-tracing = "0.1"
+tracing = "0.1.44"
 futures-util = "0.3.32"
+macros_impl = { package = "macros", path = "macros" }
