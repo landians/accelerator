@@ -69,6 +69,25 @@ pub struct CacheMetricsSnapshot {
     pub invalidation_receive_failures: u64,
 }
 
+/// Read-only runtime diagnostic snapshot for troubleshooting.
+#[derive(Debug, Clone)]
+pub struct CacheDiagnosticSnapshot {
+    /// Effective cache configuration.
+    pub config: CacheConfig,
+    /// Current runtime counters.
+    pub metrics: CacheMetricsSnapshot,
+    /// Whether local backend is wired.
+    pub local_backend_ready: bool,
+    /// Whether remote backend is wired.
+    pub remote_backend_ready: bool,
+    /// Whether loader is configured.
+    pub loader_configured: bool,
+    /// Whether invalidation listener has been started.
+    pub invalidation_listener_started: bool,
+    /// Invalidation channel when broadcast listener is applicable.
+    pub invalidation_channel: Option<String>,
+}
+
 /// Atomic metrics storage used by the cache instance.
 #[derive(Debug, Default)]
 struct CacheMetrics {
@@ -191,36 +210,77 @@ where
         self.metrics.snapshot()
     }
 
+    /// Returns a read-only runtime snapshot for diagnosis and debugging.
+    pub fn diagnostic_snapshot(&self) -> CacheDiagnosticSnapshot {
+        CacheDiagnosticSnapshot {
+            config: self.config.clone(),
+            metrics: self.metrics_snapshot(),
+            local_backend_ready: self.local.is_some(),
+            remote_backend_ready: self.remote.is_some(),
+            loader_configured: self.loader.is_some(),
+            invalidation_listener_started: self
+                .invalidation_listener_started
+                .load(Ordering::Acquire),
+            invalidation_channel: self
+                .should_start_invalidation_listener()
+                .then(|| self.invalidation_channel()),
+        }
+    }
+
+    /// Exports metrics as Prometheus text with `area` label.
+    pub fn prometheus_metrics(&self) -> String {
+        crate::observability::render_prometheus(&self.config.area, &self.metrics_snapshot())
+    }
+
+    /// Exports metrics as OpenTelemetry-friendly point list.
+    pub fn otel_metric_points(&self) -> Vec<crate::observability::OtelMetricPoint> {
+        crate::observability::to_otel_points(&self.config.area, &self.metrics_snapshot())
+    }
+
     /// Reads one key from cache layers and falls back to loader on miss.
     #[instrument(name = "cache.get", skip_all, fields(area = %self.config.area))]
     pub async fn get(&self, key: &K, options: &ReadOptions) -> CacheResult<Option<V>> {
         self.ensure_invalidation_listener();
+        let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        let stale_candidate = self.read_local_stale_value(&encoded_key).await?;
+        let key_hash = Self::hash_encoded_key(&encoded_key);
 
-        if let Some(local_entry) = self.read_local_value(&encoded_key).await? {
-            let expire_at = local_entry.expire_at;
-            let value = Self::entry_to_value(local_entry);
-            self.refresh_ahead_if_needed(key, &encoded_key, expire_at, options)
-                .await;
-            return Ok(value);
-        }
+        let result = async {
+            let stale_candidate = self.read_local_stale_value(&encoded_key).await?;
 
-        if let Some(value) = self
-            .read_remote_value_and_backfill_local(&encoded_key)
-            .await?
-        {
-            return Ok(value);
-        }
+            if let Some(local_entry) = self.read_local_value(&encoded_key).await? {
+                let expire_at = local_entry.expire_at;
+                let value = Self::entry_to_value(local_entry);
+                self.refresh_ahead_if_needed(key, &encoded_key, expire_at, options)
+                    .await;
+                return Ok(value);
+            }
 
-        if options.disable_load || self.loader.is_none() {
-            return Ok(None);
-        }
+            if let Some(value) = self
+                .read_remote_value_and_backfill_local(&encoded_key)
+                .await?
+            {
+                return Ok(value);
+            }
 
-        match self.load_on_miss(key, &encoded_key).await {
-            Ok(value) => Ok(value),
-            Err(err) => self.stale_fallback_or_error(err, stale_candidate, options),
+            if options.disable_load || self.loader.is_none() {
+                return Ok(None);
+            }
+
+            match self.load_on_miss(key, &encoded_key).await {
+                Ok(value) => Ok(value),
+                Err(err) => self.stale_fallback_or_error(err, stale_candidate, options),
+            }
         }
+        .await;
+
+        let result_tag = match &result {
+            Ok(Some(_)) => "ok_some",
+            Ok(None) => "ok_none",
+            Err(_) => "error",
+        };
+        self.log_operation("get", key_hash, started, result_tag, result.as_ref().err());
+        result
     }
 
     /// Reads multiple keys and returns a per-key optional value map.
@@ -231,133 +291,267 @@ where
         options: &ReadOptions,
     ) -> CacheResult<HashMap<K, Option<V>>> {
         self.ensure_invalidation_listener();
-        let mut values = HashMap::with_capacity(keys.len());
+        let started = Instant::now();
         let encoded_pairs = keys
             .iter()
             .map(|key| (key.clone(), self.encoded_key(key)))
             .collect::<Vec<_>>();
+        let encoded_keys = encoded_pairs
+            .iter()
+            .map(|(_, encoded_key)| encoded_key.clone())
+            .collect::<Vec<_>>();
+        let key_hash = Self::hash_encoded_keys(&encoded_keys);
 
-        let mut misses = self.fill_from_local(encoded_pairs, &mut values).await?;
-        misses = self
-            .fill_from_remote_and_backfill_local(misses, &mut values)
-            .await?;
+        let result = async {
+            let mut values = HashMap::with_capacity(keys.len());
+            let mut misses = self.fill_from_local(encoded_pairs, &mut values).await?;
+            misses = self
+                .fill_from_remote_and_backfill_local(misses, &mut values)
+                .await?;
 
-        if misses.is_empty() || options.disable_load || self.loader.is_none() {
-            for (key, _) in misses {
-                values.insert(key, None);
+            if misses.is_empty() || options.disable_load || self.loader.is_none() {
+                for (key, _) in misses {
+                    values.insert(key, None);
+                }
+                return Ok(values);
             }
-            return Ok(values);
-        }
 
-        if self.config.penetration_protect {
-            for (key, encoded_key) in misses {
-                let value = self.load_on_miss(&key, &encoded_key).await?;
-                values.insert(key, value);
+            if self.config.penetration_protect {
+                for (key, encoded_key) in misses {
+                    let value = self.load_on_miss(&key, &encoded_key).await?;
+                    values.insert(key, value);
+                }
+                return Ok(values);
             }
-            return Ok(values);
-        }
 
-        let loader = self
-            .loader
-            .as_ref()
-            .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
+            let loader = self
+                .loader
+                .as_ref()
+                .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
 
-        let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
+            let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
 
-        let loaded_map = if let Some(timeout) = self.config.loader_timeout {
-            match time::timeout(timeout, loader.mload(&request_keys)).await {
-                Ok(value) => value,
-                Err(_) => return Err(CacheError::Timeout("loader")),
+            let loaded_map = if let Some(timeout) = self.config.loader_timeout {
+                match time::timeout(timeout, loader.mload(&request_keys)).await {
+                    Ok(value) => value,
+                    Err(_) => return Err(CacheError::Timeout("loader")),
+                }
+            } else {
+                loader.mload(&request_keys).await
+            }?;
+
+            for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
+                let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
+                self.write_by_mode(&encoded_key, loaded.clone()).await?;
+                values.insert(key, loaded);
             }
-        } else {
-            loader.mload(&request_keys).await
-        }?;
 
-        for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
-            let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
-            self.write_by_mode(&encoded_key, loaded.clone()).await?;
-            values.insert(key, loaded);
+            Ok(values)
         }
+        .await;
 
-        Ok(values)
+        let result_tag = match &result {
+            Ok(values) if values.is_empty() => "ok_empty",
+            Ok(_) => "ok",
+            Err(_) => "error",
+        };
+        self.log_operation("mget", key_hash, started, result_tag, result.as_ref().err());
+        result
     }
 
     /// Writes one key to active cache layers.
     #[instrument(name = "cache.set", skip_all, fields(area = %self.config.area))]
     pub async fn set(&self, key: &K, value: Option<V>) -> CacheResult<()> {
         self.ensure_invalidation_listener();
+        let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        self.write_by_mode(&encoded_key, value).await
+        let key_hash = Self::hash_encoded_key(&encoded_key);
+        let result = self.write_by_mode(&encoded_key, value).await;
+        self.log_operation("set", key_hash, started, "done", result.as_ref().err());
+        result
     }
 
     /// Writes multiple key/value entries to cache layers.
     #[instrument(name = "cache.mset", skip_all, fields(area = %self.config.area, size = entries.len()))]
     pub async fn mset(&self, entries: HashMap<K, Option<V>>) -> CacheResult<()> {
         self.ensure_invalidation_listener();
+        let started = Instant::now();
+        let mut encoded_entries = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            self.set(&key, value).await?;
+            encoded_entries.push((self.encoded_key(&key), value));
         }
-        Ok(())
+        let encoded_keys = encoded_entries
+            .iter()
+            .map(|(encoded_key, _)| encoded_key.clone())
+            .collect::<Vec<_>>();
+        let key_hash = Self::hash_encoded_keys(&encoded_keys);
+
+        let result = async {
+            for (encoded_key, value) in encoded_entries {
+                self.write_by_mode(&encoded_key, value).await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        self.log_operation("mset", key_hash, started, "done", result.as_ref().err());
+        result
     }
 
     /// Deletes one key from all active cache layers.
     #[instrument(name = "cache.del", skip_all, fields(area = %self.config.area))]
     pub async fn del(&self, key: &K) -> CacheResult<()> {
         self.ensure_invalidation_listener();
+        let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        self.delete_remote_if_needed(&encoded_key).await?;
-        self.delete_local_if_needed(&encoded_key).await?;
-        self.publish_invalidation_if_needed(vec![encoded_key])
-            .await?;
-        Ok(())
+        let key_hash = Self::hash_encoded_key(&encoded_key);
+
+        let result = async {
+            self.delete_remote_if_needed(&encoded_key).await?;
+            self.delete_local_if_needed(&encoded_key).await?;
+            self.publish_invalidation_if_needed(vec![encoded_key])
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        self.log_operation("del", key_hash, started, "done", result.as_ref().err());
+        result
     }
 
     /// Deletes multiple keys from all active cache layers.
     #[instrument(name = "cache.mdel", skip_all, fields(area = %self.config.area, size = keys.len()))]
     pub async fn mdel(&self, keys: &[K]) -> CacheResult<()> {
         self.ensure_invalidation_listener();
-        if keys.is_empty() {
-            return Ok(());
-        }
+        let started = Instant::now();
 
         let encoded = keys
             .iter()
             .map(|key| self.encoded_key(key))
             .collect::<Vec<_>>();
+        let key_hash = Self::hash_encoded_keys(&encoded);
 
-        self.batch_delete_remote_if_needed(&encoded).await?;
-        self.batch_delete_local_if_needed(&encoded).await?;
-        self.publish_invalidation_if_needed(encoded).await?;
-        Ok(())
+        let result = async {
+            if encoded.is_empty() {
+                return Ok(());
+            }
+
+            self.batch_delete_remote_if_needed(&encoded).await?;
+            self.batch_delete_local_if_needed(&encoded).await?;
+            self.publish_invalidation_if_needed(encoded).await?;
+            Ok(())
+        }
+        .await;
+
+        self.log_operation("mdel", key_hash, started, "done", result.as_ref().err());
+        result
     }
 
     /// Preloads keys through normal read path in configurable chunks.
     #[instrument(name = "cache.warmup", skip_all, fields(area = %self.config.area, size = keys.len()))]
     pub async fn warmup(&self, keys: &[K]) -> CacheResult<usize> {
         self.ensure_invalidation_listener();
-        if !self.config.warmup_enabled {
-            return Ok(0);
-        }
-        if keys.is_empty() {
-            return Ok(0);
-        }
+        let started = Instant::now();
+        let encoded_keys = keys
+            .iter()
+            .map(|key| self.encoded_key(key))
+            .collect::<Vec<_>>();
+        let key_hash = Self::hash_encoded_keys(&encoded_keys);
 
-        let options = ReadOptions {
-            allow_stale: false,
-            disable_load: false,
+        let result = async {
+            if !self.config.warmup_enabled {
+                return Ok(0);
+            }
+            if keys.is_empty() {
+                return Ok(0);
+            }
+
+            let options = ReadOptions {
+                allow_stale: false,
+                disable_load: false,
+            };
+
+            let mut loaded = 0usize;
+            for chunk in keys.chunks(self.config.warmup_batch_size) {
+                let values = self.mget(chunk, &options).await?;
+                loaded += values.values().filter(|value| value.is_some()).count();
+            }
+            Ok(loaded)
+        }
+        .await;
+
+        let result_tag = match &result {
+            Ok(loaded) if *loaded == 0 => "ok_zero",
+            Ok(_) => "ok_loaded",
+            Err(_) => "error",
         };
-
-        let mut loaded = 0usize;
-        for chunk in keys.chunks(self.config.warmup_batch_size) {
-            let values = self.mget(chunk, &options).await?;
-            loaded += values.values().filter(|value| value.is_some()).count();
-        }
-        Ok(loaded)
+        self.log_operation(
+            "warmup",
+            key_hash,
+            started,
+            result_tag,
+            result.as_ref().err(),
+        );
+        result
     }
 
     /// Encodes business key into namespaced storage key.
     fn encoded_key(&self, key: &K) -> String {
         format!("{}:{}", self.config.area, (self.key_converter)(key))
+    }
+
+    /// Hashes one encoded key for logging without exposing raw key content.
+    fn hash_encoded_key(encoded_key: &str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        encoded_key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Hashes a batch of encoded keys for logging aggregation.
+    fn hash_encoded_keys(encoded_keys: &[String]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for encoded_key in encoded_keys {
+            encoded_key.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Emits standardized operation log for governance and troubleshooting.
+    fn log_operation(
+        &self,
+        op: &'static str,
+        key_hash: u64,
+        started: Instant,
+        result: &'static str,
+        error: Option<&CacheError>,
+    ) {
+        let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let error_kind = error.map(CacheError::kind).unwrap_or("none");
+
+        if let Some(error) = error {
+            tracing::warn!(
+                target: "accelerator::ops",
+                area = %self.config.area,
+                op,
+                key_hash,
+                result,
+                latency_ms,
+                error_kind,
+                error = %error,
+                "cache operation completed",
+            );
+        } else {
+            tracing::info!(
+                target: "accelerator::ops",
+                area = %self.config.area,
+                op,
+                key_hash,
+                result,
+                latency_ms,
+                error_kind,
+                "cache operation completed",
+            );
+        }
     }
 
     /// Returns whether local layer is active.
@@ -1298,6 +1492,45 @@ mod tests {
         assert_eq!(metrics.load_total, 1);
         assert_eq!(metrics.load_error, 1);
         assert_eq!(metrics.load_success, 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_snapshot_contains_effective_config_and_flags() {
+        let cache = test_cache_builder()
+            .area("diag-area")
+            .broadcast_invalidation(true)
+            .loader_fn(|key: u64| async move { Ok(Some(format!("v-{key}"))) })
+            .build()
+            .unwrap();
+
+        let _ = cache.get(&100, &ReadOptions::default()).await.unwrap();
+        let snapshot = cache.diagnostic_snapshot();
+
+        assert_eq!(snapshot.config.area, "diag-area");
+        assert!(snapshot.loader_configured);
+        assert!(snapshot.local_backend_ready);
+        assert!(!snapshot.remote_backend_ready);
+        assert!(!snapshot.invalidation_listener_started);
+        assert!(snapshot.invalidation_channel.is_none());
+        assert_eq!(snapshot.metrics.load_success, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_export_helpers_include_area_label() {
+        let cache = test_cache_builder().area("metric-area").build().unwrap();
+        cache.set(&9, Some("v9".to_string())).await.unwrap();
+        let _ = cache.get(&9, &ReadOptions::default()).await.unwrap();
+
+        let text = cache.prometheus_metrics();
+        assert!(text.contains("accelerator_cache_local_hit_total{area=\"metric-area\"}"));
+
+        let otel_points = cache.otel_metric_points();
+        assert_eq!(otel_points.len(), 16);
+        assert!(
+            otel_points
+                .iter()
+                .all(|point| { point.attributes == vec![("area", "metric-area".to_string())] })
+        );
     }
 
     #[tokio::test]

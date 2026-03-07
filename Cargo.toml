@@ -16,3 +16,11 @@ tokio = { version = "1.50.0", features = ["sync", "time", "rt-multi-thread", "ma
 tracing = "0.1.44"
 futures-util = "0.3.32"
 macros_impl = { package = "macros", path = "macros" }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["async_tokio"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[[bench]]
+name = "cache_path_bench"
+harness = false

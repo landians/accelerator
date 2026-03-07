@@ -480,12 +480,28 @@ sequenceDiagram
 - `invalidation_publish` / `invalidation_publish_failures`
 - `invalidation_receive` / `invalidation_receive_failures`
 
-后续可再对接 Prometheus/OpenTelemetry exporter。
+同时提供两种开箱导出适配：
+
+1. `LevelCache::prometheus_metrics()`：直接导出 Prometheus text 格式（带 `area` label）。
+2. `LevelCache::otel_metric_points()`：导出 OpenTelemetry 友好的点位结构（`name/value/attributes`）。
+
+稳定指标名统一前缀：`accelerator_cache_*`（例如 `accelerator_cache_local_hit_total`）。
 
 ### 10.2 日志（Logging）
 
-关键字段：`area`、`key_hash`、`layer`、`result`、`latency_ms`、`trace_id`。  
-注意不要输出原始敏感 key/value。
+当前已统一操作日志字段（target=`accelerator::ops`）：
+
+- `area`
+- `op`
+- `key_hash`
+- `result`
+- `latency_ms`
+- `error_kind`
+
+补充说明：
+
+1. `key_hash` 来自编码后 key 的 hash，不输出原始敏感 key/value。
+2. `error_kind` 由 `CacheError::kind()` 提供稳定分类：`invalid_config/backend/loader/timeout/none`。
 
 ### 10.3 追踪（Tracing）
 
@@ -500,6 +516,16 @@ sequenceDiagram
 - `cache.load`
 
 需要业务侧注入 subscriber（例如 `tracing-subscriber`）后可见。
+
+### 10.4 运行时诊断接口（只读）
+
+新增 `LevelCache::diagnostic_snapshot()`，返回以下信息：
+
+1. 生效配置快照（`CacheConfig`）。
+2. 计数器快照（`CacheMetricsSnapshot`）。
+3. 运行状态：local/remote/loader 是否就绪、失效监听器是否已启动、监听 channel（若适用）。
+
+该接口用于线上排障和配置核对，不暴露可变操作能力。
 
 ---
 
@@ -528,6 +554,16 @@ sequenceDiagram
 2. Loader 慢查询/错误。
 3. 广播通道消息丢失或延迟。
 4. 大规模 key 同时过期。
+
+### 12.3 运维排障手册
+
+已补充专门排障文档：`docs/cache-ops-runbook.md`，覆盖以下常见路径：
+
+1. Redis 不可达（读写失败/连接异常）。
+2. 失效广播异常（Pub/Sub 订阅或消费失败）。
+3. 回源超时（loader timeout）。
+
+建议将该文档纳入发布 checklist 与值班排障入口。
 
 验收目标：在故障场景下组件行为可预测，且指标能反映根因。
 
@@ -620,15 +656,337 @@ cargo run --example fixed_backend_best_practice
 5. 可用 `refresh_ahead + stale_on_error` 提升故障期可用性。
 6. 使用 `loader_fn` 定义最小回源路径，并通过 `ReadOptions.disable_load` 控制自动回源。
 
-### 16.3 Redis 集成测试策略
+生产场景推荐使用“`Repo` 实例 + `sqlx` + `Loader/MLoader` 嵌入式适配”模式，避免侵入业务查询函数。
 
-当前版本已提供真实 Redis 集成测试：`tests/redis_integration.rs`。
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use accelerator::loader::{Loader, MLoader};
+use accelerator::{CacheError, CacheResult};
+use sqlx::PgPool;
+
+#[derive(Clone, Debug)]
+pub struct User {
+    pub id: u64,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct UserRepo {
+    pool: PgPool,
+}
+
+impl UserRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn find_by_id(&self, id: u64) -> Result<Option<User>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, name FROM users WHERE id = $1",
+        )
+        .bind(id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(id, name)| User {
+            id: id as u64,
+            name,
+        }))
+    }
+
+    pub async fn find_by_ids(&self, ids: &[u64]) -> Result<HashMap<u64, User>, sqlx::Error> {
+        let ids_i64 = ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, name FROM users WHERE id = ANY($1::bigint[])",
+        )
+        .bind(&ids_i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut found = HashMap::with_capacity(rows.len());
+        for (id, name) in rows {
+            found.insert(
+                id as u64,
+                User {
+                    id: id as u64,
+                    name,
+                },
+            );
+        }
+        Ok(found)
+    }
+}
+
+#[derive(Clone)]
+pub struct UserRepoLoader {
+    repo: Arc<UserRepo>,
+}
+
+impl UserRepoLoader {
+    pub fn new(repo: Arc<UserRepo>) -> Self {
+        Self { repo }
+    }
+}
+
+impl Loader<u64, User> for UserRepoLoader {
+    async fn load(&self, key: &u64) -> CacheResult<Option<User>> {
+        self.repo
+            .find_by_id(*key)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_id failed: {err}")))
+    }
+}
+
+impl MLoader<u64, User> for UserRepoLoader {
+    async fn mload(&self, keys: &[u64]) -> CacheResult<HashMap<u64, Option<User>>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let found = self
+            .repo
+            .find_by_ids(keys)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_ids failed: {err}")))?;
+
+        let mut values = HashMap::with_capacity(keys.len());
+        for key in keys {
+            values.insert(*key, found.get(key).cloned());
+        }
+        Ok(values)
+    }
+}
+```
+
+这个模板的关键点：
+
+1. `Repo` 负责纯查询语义，`Loader/MLoader` 只做缓存协议适配与错误映射。
+2. 单查/批查函数可独立复用，不会因缓存引入而污染业务数据访问层。
+3. `mload` 返回 `HashMap<K, Option<V>>`，明确表达“命中”和“未命中”两类结果。
+
+下面给一段“直接可复制”的最小组装片段，把 `LevelCacheBuilder + UserRepoLoader` 串成完整可运行示例：
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+use accelerator::builder::LevelCacheBuilder;
+use accelerator::cache::ReadOptions;
+use accelerator::config::CacheMode;
+use accelerator::{local, remote};
+use sqlx::postgres::PgPoolOptions;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let redis_url = std::env::var("ACCELERATOR_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let pg_dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://accelerator:accelerator@127.0.0.1:5432/accelerator".to_string()
+    });
+
+    // 1) 初始化 Repo（sqlx）
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&pg_dsn)
+        .await?;
+    let repo = Arc::new(UserRepo::new(pg_pool));
+
+    // 2) 初始化 Loader（把 Repo 嵌入缓存回源协议）
+    let loader = UserRepoLoader::new(repo.clone());
+
+    // 3) 初始化固定后端（moka + redis）
+    let l1 = local::moka::<User>().max_capacity(100_000).build()?;
+    let l2 = remote::redis::<User>()
+        .url(redis_url)
+        .key_prefix("prod:user")
+        .build()?;
+
+    // 4) 构建 LevelCache
+    let cache = LevelCacheBuilder::<u64, User, UserRepoLoader>::new()
+        .area("user_profile")
+        .mode(CacheMode::Both)
+        .local(l1)
+        .remote(l2)
+        .loader(loader)
+        .local_ttl(Duration::from_secs(60))
+        .remote_ttl(Duration::from_secs(300))
+        .null_ttl(Duration::from_secs(30))
+        .penetration_protect(true)
+        .loader_timeout(Duration::from_millis(200))
+        .build()?;
+
+    // 5) 业务读取（miss 自动回源；hit 直接返回）
+    let one = cache.get(&1001, &ReadOptions::default()).await?;
+    println!("user#1001 => {one:?}");
+
+    // 6) 批量读取（内部走 mget -> mload -> mset）
+    let batch = cache.mget(&[1001, 1002, 1003], &ReadOptions::default()).await?;
+    println!("batch => {batch:?}");
+
+    Ok(())
+}
+```
+
+> 其中 `User`、`UserRepo`、`UserRepoLoader` 直接复用上一段模板定义即可；如果你本地按 `scripts/docker-compose.yml` 启动，可直接跑通这段流程。
+
+为了对照“手写 API”与“宏 API”的关系，下面给出同一组装方式下的服务层写法。  
+前提：继续复用上面构建出的 `cache` 与 `repo`（即 `Arc<LevelCache<...>>` + `Arc<UserRepo>`）。
+
+### 16.2.1 手写 API vs 宏 API 对照（同一 Builder）
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use accelerator::cache::{LevelCache, ReadOptions};
+use accelerator::macros::{cacheable, cacheable_batch};
+use accelerator::{CacheError, CacheResult};
+
+#[derive(Clone)]
+pub struct UserService {
+    repo: Arc<UserRepo>,
+    user_cache: Arc<LevelCache<u64, User, UserRepoLoader>>,
+}
+
+impl UserService {
+    pub fn new(repo: Arc<UserRepo>, user_cache: Arc<LevelCache<u64, User, UserRepoLoader>>) -> Self {
+        Self { repo, user_cache }
+    }
+}
+```
+
+#### A) 手写 API（显式调用 get/mget/set/mset）
+
+```rust
+impl UserService {
+    pub async fn get_user_manual(&self, user_id: u64) -> CacheResult<Option<User>> {
+        if let Some(hit) = self
+            .user_cache
+            .get(
+                &user_id,
+                &ReadOptions {
+                    allow_stale: false,
+                    disable_load: true,
+                },
+            )
+            .await?
+        {
+            return Ok(Some(hit));
+        }
+
+        let loaded = self
+            .repo
+            .find_by_id(user_id)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_id failed: {err}")))?;
+
+        self.user_cache.set(&user_id, loaded.clone()).await?;
+        Ok(loaded)
+    }
+
+    pub async fn batch_get_users_manual(
+        &self,
+        user_ids: Vec<u64>,
+    ) -> CacheResult<HashMap<u64, Option<User>>> {
+        let mut cached = self
+            .user_cache
+            .mget(
+                &user_ids,
+                &ReadOptions {
+                    allow_stale: false,
+                    disable_load: true,
+                },
+            )
+            .await?;
+
+        let misses = user_ids
+            .iter()
+            .filter(|id| cached.get(id).cloned().flatten().is_none())
+            .copied()
+            .collect::<Vec<_>>();
+
+        if misses.is_empty() {
+            return Ok(cached);
+        }
+
+        let found = self
+            .repo
+            .find_by_ids(&misses)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_ids failed: {err}")))?;
+
+        let mut write_back = Vec::with_capacity(misses.len());
+        for id in misses {
+            let value = found.get(&id).cloned();
+            cached.insert(id, value.clone());
+            write_back.push((id, value));
+        }
+        self.user_cache.mset(&write_back).await?;
+
+        Ok(cached)
+    }
+}
+```
+
+#### B) 宏 API（用注解替代显式缓存编排）
+
+```rust
+impl UserService {
+    #[cacheable(cache = self.user_cache, key = user_id, allow_stale = false)]
+    pub async fn get_user_macro(&self, user_id: u64) -> CacheResult<Option<User>> {
+        self.repo
+            .find_by_id(user_id)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_id failed: {err}")))
+    }
+
+    #[cacheable_batch(cache = self.user_cache, keys = user_ids, allow_stale = false)]
+    pub async fn batch_get_users_macro(
+        &self,
+        user_ids: Vec<u64>,
+    ) -> CacheResult<HashMap<u64, Option<User>>> {
+        let found = self
+            .repo
+            .find_by_ids(&user_ids)
+            .await
+            .map_err(|err| CacheError::Loader(format!("find_by_ids failed: {err}")))?;
+
+        let mut values = HashMap::with_capacity(user_ids.len());
+        for id in user_ids {
+            values.insert(id, found.get(&id).cloned());
+        }
+        Ok(values)
+    }
+}
+```
+
+一一映射关系：
+
+1. `cache.get(... disable_load=true)` ↔ `#[cacheable(...)]` 的前置读缓存。
+2. miss 后调用 `repo.find_by_id` ↔ `#[cacheable]` 包裹的方法体（仅保留业务回源）。
+3. `cache.set` 回写 ↔ `#[cacheable]` 自动回写。
+4. `cache.mget(... disable_load=true)` + misses 计算 ↔ `#[cacheable_batch]` 自动处理 misses。
+5. `cache.mset` 回写批量结果 ↔ `#[cacheable_batch]` 自动批量回写。
+
+### 16.3 集成测试策略（Redis / Postgres）
+
+当前版本已提供两类真实环境集成测试：
+
+1. Redis 集成测试：`tests/redis_integration.rs`
+2. Redis + Postgres 联合集成测试：`tests/stack_integration.rs`（Postgres 回源通过 `sqlx`）
 
 测试约束：
 
 1. 每个用例运行前先探测 Redis 可达性（`PING`）。
-2. Redis 不可达时自动跳过该用例，不影响本地单测结果。
-3. 默认地址为 `redis://127.0.0.1:6379`，可通过 `ACCELERATOR_TEST_REDIS_URL` 覆盖。
+2. 联合集成测试会同时探测 Postgres 可达性；任一不可达时自动跳过对应用例。
+3. 默认地址：
+   - Redis：`redis://127.0.0.1:6379`
+   - Postgres：`postgres://accelerator:accelerator@127.0.0.1:5432/accelerator`
+4. 可通过环境变量覆盖：
+   - `ACCELERATOR_TEST_REDIS_URL`
+   - `ACCELERATOR_TEST_POSTGRES_DSN`
 
 推荐执行方式：
 
@@ -636,12 +994,14 @@ cargo run --example fixed_backend_best_practice
 cargo test
 ```
 
-若本地 Redis 已启动，将同时执行单元测试与 Redis 集成测试。
+若本地环境按 `scripts/docker-compose.yml` 启动，将同时执行单元测试与集成测试。  
+本地环境启动与链路查看说明见：`docs/local-stack-integration.md`。
 
 ### 16.4 当前版本边界说明
 
 - 过程宏 V2 已落地，当前支持单 key + 批量注解：`cacheable` / `cache_put` / `cache_evict` / `cacheable_batch` / `cache_evict_batch`。
 - 宏参数校验与签名报错已增强，覆盖 `async method`、重复参数、未知参数、`on_cache_error` 取值等常见误用。
+- 治理与观测控制面基础能力已落地：指标导出适配、标准日志字段、运行时诊断快照、运维手册。
 - `listener/tag` 风格注解尚未实现，仍作为后续增强项。
 
 ---
@@ -1016,6 +1376,13 @@ async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
 1. 故障注入场景下可通过指标+日志快速定位根因。
 2. 线上排障文档可覆盖 80% 常见问题路径。
 
+当前状态（2026-03-07）：
+
+1. [x] 指标出口适配已提供（`prometheus_metrics` / `otel_metric_points`）。
+2. [x] 关键操作日志字段已统一（`area/op/key_hash/result/latency_ms/error_kind`）。
+3. [x] 运行时诊断接口已提供（`diagnostic_snapshot`）。
+4. [x] 运维排障手册已补充（`docs/cache-ops-runbook.md`）。
+
 ### 18.4 迭代 D：性能与工程化收敛（中长期）
 
 目标：将宏能力与核心缓存路径在性能与工程规范上长期稳定化。
@@ -1038,11 +1405,19 @@ async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
 1. 宏路径性能与手写路径差距在可接受范围内（有量化结论）。
 2. 每次发布具备可追踪的兼容性说明与迁移指导。
 
+当前状态（2026-03-07）：
+
+1. [x] `criterion` 基准测试已提供（`benches/cache_path_bench.rs`）。
+   - 默认覆盖本地命中 + miss 回源；远端命中在 Redis 可用时可选执行（`ACCELERATOR_BENCH_REDIS_URL`）。
+2. [x] 回归门禁工具已提供（`src/bin/check_bench_regression.rs`，支持阈值配置）。
+3. [x] Benchmark 基线快照已落地（`docs/benchmarks/cache_path_bench.json`）。
+4. [x] API 稳定策略 + 迁移模板 + 推荐项目结构已补充（`docs/performance-engineering-playbook.md`）。
+
 ### 18.5 执行顺序建议
 
-1. 已完成 **迭代 A（V1.1 稳定化）** 与 **迭代 B（批量宏 V2）**。
-2. 下一步优先推进 **迭代 C（治理与观测控制面）**，先补齐指标与日志标准化。
-3. 性能基准与门禁建议从当前版本开始持续执行（可与迭代 C 并行）。
+1. 已完成 **迭代 A（V1.1 稳定化）**、**迭代 B（批量宏 V2）**、**迭代 C（治理与观测控制面）**、**迭代 D（性能与工程化收敛）**。
+2. 后续以“持续治理”方式维护：每次版本迭代都执行 benchmark 回归门禁。
+3. 发布流程建议固定执行：`cargo test` + `cargo bench` + `cargo run --bin check_bench_regression -- --threshold 0.15` + runbook 自检。
 
 ### 18.6 风险与回退策略
 
