@@ -30,61 +30,22 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
-  tempo:
-    image: grafana/tempo:2.7.1
-    user: "0:0"
-    command: ["-config.file=/etc/tempo.yaml"]
+  clickstack:
+    image: clickhouse/clickstack-all-in-one:2
     ports:
-      - "3200:3200"
-    volumes:
-      - ./tempo.yml:/etc/tempo.yaml:ro
-      - tempo-data:/tmp/tempo
-
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.115.1
-    command: ["--config=/etc/otel-collector.yml"]
-    ports:
+      - "8080:8080"
       - "4317:4317"
       - "4318:4318"
-      - "8889:8889"
+      - "8123:8123"
+      - "9000:9000"
     volumes:
-      - ./otel-collector.yml:/etc/otel-collector.yml:ro
-    depends_on:
-      - tempo
-
-  prometheus:
-    image: prom/prometheus:v3.0.0
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=7d"
-      - "--web.enable-remote-write-receiver"
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    depends_on:
-      - otel-collector
-
-  grafana:
-    image: grafana/grafana:12.0.0
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_USERS_DEFAULT_THEME: light
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana-data:/var/lib/grafana
-    depends_on:
-      - prometheus
-      - tempo
+      - clickstack-data:/data/db
+      - clickstack-clickhouse-data:/var/lib/clickhouse
+      - clickstack-clickhouse-logs:/var/log/clickhouse-server
 
 volumes:
   redis-data:
   postgres-data:
-  tempo-data:
-  prometheus-data:
-  grafana-data:
+  clickstack-data:
+  clickstack-clickhouse-data:
+  clickstack-clickhouse-logs:

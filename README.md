@@ -42,7 +42,7 @@ Integration tests that require a real Redis are in `tests/redis_integration.rs`.
 - Each test first probes Redis and will skip itself when Redis is unavailable.
 - You can override Redis endpoint with `ACCELERATOR_TEST_REDIS_URL`.
 
-## Full Local Stack (Redis + Postgres + Prometheus + Grafana + OTel + Tempo)
+## Full Local Stack (Redis + Postgres + ClickStack)
 
 The repository provides a ready-to-run docker compose stack:
 
@@ -59,5 +59,14 @@ cargo test --test stack_integration
 ```
 
 `stack_integration` uses a real `sqlx + Postgres` loader path.
+
+Observability UI is exposed by ClickStack at `http://127.0.0.1:8080` and OTLP ingest ports are `4317/4318`.
+
+For reusable application-side OTLP bootstrap, enable feature `otlp` and run:
+
+```bash
+ACCELERATOR_CLICKSTACK_AUTHORIZATION="<YOUR_INGESTION_KEY>" \
+cargo run --features otlp --example clickstack_otlp
+```
 
 Detailed setup and tracing notes: `docs/local-stack-integration.md`.

@@ -18,6 +18,9 @@ pub mod local;
 pub mod observability;
 /// Remote cache backend (redis).
 pub mod remote;
+/// Optional OTLP telemetry bootstrap helpers (feature: `otlp`).
+#[cfg(feature = "otlp")]
+pub mod telemetry;
 /// Procedural macros re-export.
 pub mod macros {
     pub use macros_impl::{cache_evict, cache_evict_batch, cache_put, cacheable, cacheable_batch};
@@ -37,5 +40,8 @@ pub use loader::{FnLoader, Loader, MLoader, NoopLoader};
 pub use observability::{
     MetricPoint, OtelMetricPoint, metric_points, render_prometheus, to_otel_points,
 };
+/// Re-export of optional OTLP telemetry helpers.
+#[cfg(feature = "otlp")]
+pub use telemetry::{OtlpTelemetryBuilder, OtlpTransport, TelemetryGuard, TelemetryInitError};
 /// Re-export of tracing for macro-generated logging.
 pub use tracing;

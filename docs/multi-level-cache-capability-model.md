@@ -517,6 +517,14 @@ sequenceDiagram
 
 需要业务侧注入 subscriber（例如 `tracing-subscriber`）后可见。
 
+为便于宿主系统集成，当前仓库已提供可复用 OTLP 初始化组件（feature: `otlp`）：
+
+1. `OtlpTelemetryBuilder`
+2. `OtlpTransport`
+3. `TelemetryGuard`
+
+可直接用于将 `cache.*` spans 导出到 ClickStack（或任意 OTLP 后端）。
+
 ### 10.4 运行时诊断接口（只读）
 
 新增 `LevelCache::diagnostic_snapshot()`，返回以下信息：
@@ -995,7 +1003,7 @@ cargo test
 ```
 
 若本地环境按 `scripts/docker-compose.yml` 启动，将同时执行单元测试与集成测试。  
-本地环境启动与链路查看说明见：`docs/local-stack-integration.md`。
+本地环境启动与链路查看说明见：`docs/local-stack-integration.md`（已迁移为 ClickStack 观测栈）。
 
 ### 16.4 当前版本边界说明
 

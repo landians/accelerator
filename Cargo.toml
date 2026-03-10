@@ -5,6 +5,17 @@ edition = "2024"
 license = "MIT"
 description = "MVP multi-level cache runtime with singleflight load de-duplication"
 
+[features]
+default = []
+otlp = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tonic",
+  "dep:tracing-opentelemetry",
+  "dep:tracing-subscriber",
+]
+
 [dependencies]
 moka = { version = "0.12.14", features = ["future"] }
 redis = { version = "0.32", features = ["aio", "tokio-comp"] }
@@ -16,6 +27,12 @@ tokio = { version = "1.50.0", features = ["sync", "time", "rt-multi-thread", "ma
 tracing = "0.1.44"
 futures-util = "0.3.32"
 macros_impl = { package = "macros", path = "macros" }
+opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "http-proto", "trace"], optional = true }
+tonic = { version = "0.14.2", optional = true }
+tracing-opentelemetry = { version = "0.32.0", optional = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async_tokio"] }
