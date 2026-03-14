@@ -1,61 +1,63 @@
-# Rust 代码扁平化重构规范（通用）
+# Rust Code Flattening Guideline (General)
 
-## 1. 目标与适用范围
+> Terminology baseline: see [docs/terminology.md](./terminology.md).
 
-本规范用于指导 Rust 项目中的“降嵌套、提可读、保语义”重构，适用于：
+## 1. Goal and Scope
 
-1. 业务逻辑（同步/异步函数）。
-2. 数据访问层（数据库、缓存、外部 API）。
-3. 基础设施代码（任务调度、消息消费、观测埋点）。
-4. 单元测试与集成测试。
+This guideline standardizes flattening refactors in Rust projects to reduce nesting, improve readability, and preserve behavior.
 
-核心目标：
+Applies to:
 
-1. 主路径线性可读。
-2. 失败路径提前退出。
-3. 减少条件嵌套层级。
-4. 在不改变行为的前提下提升维护效率。
+1. Business logic (sync and async)
+2. Data access layers (DB, cache, external APIs)
+3. Infrastructure code (schedulers, consumers, telemetry paths)
+4. Unit and integration tests
 
----
+Non-goals:
 
-## 2. 设计原则
-
-### 2.1 Guard Clause 优先（先处理不可继续分支）
-
-把错误、空输入、权限不足、依赖不可用等“阻断条件”放在函数前部并 `return`，避免主流程被包在多层 `if/else` 中。
-
-### 2.2 主流程只保留步骤编排，细节下沉到 helper
-
-当一个函数同时包含“验证、查询、转换、写回、埋点”等多段逻辑时，主函数只保留阶段顺序，细节移动到命名清晰的私有函数。
-
-### 2.3 循环中优先 `continue`/`break`，避免反向缩进
-
-在批处理或扫描逻辑中，把“不处理项”尽早 `continue`，把“正常处理路径”放在循环底部。
-
-### 2.4 优先 `?` 传播错误，减少 `match Err(_)` 样板
-
-Rust 的 `Result`/`Option` 已经提供扁平化工具：`?`、`let-else`、`map`、`and_then`。  
-优先用语言特性表达“失败即返回”。
-
-### 2.5 表达式先命名，再调用
-
-复杂调用前，先构造语义变量（如 `request`、`payload`、`entry`、`deadline`），再传入函数，避免“嵌套构造 + 调用”一行过长、难调试。
-
-### 2.6 批量语义必须走批量接口
-
-对外暴露 `m*`/`batch_*` 语义的方法，不应在编排层退化为 N 次单条远程调用（除非后端无批量能力且已注释说明）。
-
-### 2.7 观测逻辑集中收口
-
-指标、日志、trace 字段尽量放在统一收口点，避免“业务代码 + 埋点代码”交叉穿插导致层级膨胀。
+1. Do not trade correctness for flatter control flow.
+2. Do not over-split straightforward logic into too many tiny helpers.
 
 ---
 
-## 3. 常用重构模式（含示例）
+## 2. Core Principles
 
-### 3.1 模式 A：嵌套 `if` -> Guard Return
+### 2.1 Prefer guard clauses first
 
-重构前：
+Handle invalid or blocking conditions early and return immediately.
+This avoids wrapping the main path in deep `if` or `match` pyramids.
+
+### 2.2 Keep orchestration in the main function, move detail to helpers
+
+When one function includes validation, loading, transformation, writes, and observability, keep only stage ordering in the main function and move detail into clearly named helpers.
+
+### 2.3 Use `continue` or `break` in loops to reduce reverse indentation
+
+For batch loops, skip irrelevant items early and keep the happy path at the bottom of the loop.
+
+### 2.4 Use Rust-native early-exit tools
+
+Prefer `?`, `let-else`, and small combinators (`map`, `and_then`) over repetitive error matching boilerplate.
+
+### 2.5 Name complex expressions before calling
+
+Build semantic variables first (for example `payload`, `entry`, `deadline`) and then pass them into function calls. This improves readability and debugging.
+
+### 2.6 Preserve batch semantics with batch APIs
+
+Methods exposing batch semantics (`m*`/`batch_*`) should not degrade to N single remote calls unless the backend has no batch capability (and this is documented).
+
+### 2.7 Centralize observability
+
+Place metrics/logging in stable collection points whenever possible, instead of interleaving observability logic across every branch.
+
+---
+
+## 3. Common Refactor Patterns (With Examples)
+
+### 3.1 Pattern A: Nested `if` -> Guard return
+
+Before:
 
 ```rust
 fn parse_user_id(input: &str) -> Result<u64, String> {
@@ -71,7 +73,7 @@ fn parse_user_id(input: &str) -> Result<u64, String> {
 }
 ```
 
-重构后：
+After:
 
 ```rust
 fn parse_user_id(input: &str) -> Result<u64, String> {
@@ -87,11 +89,9 @@ fn parse_user_id(input: &str) -> Result<u64, String> {
 }
 ```
 
----
+### 3.2 Pattern B: Deep `Option` nesting -> `?` / `let-else`
 
-### 3.2 模式 B：`match Option` 深嵌套 -> `let-else`
-
-重构前：
+Before:
 
 ```rust
 fn find_name(user: Option<User>) -> Option<String> {
@@ -106,7 +106,7 @@ fn find_name(user: Option<User>) -> Option<String> {
 }
 ```
 
-重构后：
+After:
 
 ```rust
 fn find_name(user: Option<User>) -> Option<String> {
@@ -116,11 +116,9 @@ fn find_name(user: Option<User>) -> Option<String> {
 }
 ```
 
----
+### 3.3 Pattern C: Loop pyramid -> `continue`
 
-### 3.3 模式 C：循环 `if/else` 金字塔 -> `continue`
-
-重构前：
+Before:
 
 ```rust
 for item in items {
@@ -132,7 +130,7 @@ for item in items {
 }
 ```
 
-重构后：
+After:
 
 ```rust
 for item in items {
@@ -146,20 +144,17 @@ for item in items {
 }
 ```
 
----
+### 3.4 Pattern D: Overloaded function -> staged helpers
 
-### 3.4 模式 D：单函数过载 -> 阶段化 helper
-
-重构前（示意）：
+Before (sketch):
 
 ```rust
 async fn handle(req: Request) -> Result<Response, Error> {
-    // 参数校验 + DB 查询 + 业务计算 + 写审计日志 + 组装响应
-    // 全部堆在一个函数里
+    // validation + query + transform + audit + response mapping in one place
 }
 ```
 
-重构后（示意）：
+After (sketch):
 
 ```rust
 async fn handle(req: Request) -> Result<Response, Error> {
@@ -171,11 +166,9 @@ async fn handle(req: Request) -> Result<Response, Error> {
 }
 ```
 
----
+### 3.5 Pattern E: Async nested `if let` -> early returns
 
-### 3.5 模式 E：异步 `if let` 多层 -> 早返回 + 小函数
-
-重构前：
+Before:
 
 ```rust
 async fn maybe_send(msg: Option<Message>, client: &Client) -> Result<(), Error> {
@@ -188,7 +181,7 @@ async fn maybe_send(msg: Option<Message>, client: &Client) -> Result<(), Error> 
 }
 ```
 
-重构后：
+After:
 
 ```rust
 async fn maybe_send(msg: Option<Message>, client: &Client) -> Result<(), Error> {
@@ -202,47 +195,47 @@ async fn maybe_send(msg: Option<Message>, client: &Client) -> Result<(), Error> 
 
 ---
 
-## 4. 推荐重构流程
+## 4. Recommended Refactor Workflow
 
-1. 先写“阶段清单”（validate -> load -> transform -> persist -> observe）。
-2. 标出每个阶段的失败条件，尽量前置为 guard return。
-3. 减少循环中的 `else` 块，改用 `continue/break`。
-4. 将长函数拆分为 2-5 个语义明确的 helper。
-5. 将观测代码收口（入口打开始时间，出口统一记录结果）。
-6. 跑测试并做行为比对（尤其错误路径和边界输入）。
-
----
-
-## 5. Code Review Checklist（通用）
-
-1. 函数主路径是否一眼看出执行顺序？
-2. 是否存在可提前返回的无效分支？
-3. 是否有超过 3 层的条件嵌套可以下沉？
-4. 循环里是否有可以 `continue` 的分支仍写成 `else`？
-5. 是否错误地把批量语义实现成单条远程循环？
-6. 错误处理是否统一、是否充分使用 `?`？
-7. 日志/指标是否集中而非散落在每个分支？
+1. List execution stages (`validate -> load -> transform -> persist -> observe`).
+2. Identify early exit conditions and convert them into guard clauses.
+3. Replace loop `else` blocks with `continue`/`break` where possible.
+4. Split long functions into 2-5 semantically named helpers.
+5. Consolidate observability in stable collection points.
+6. Re-run tests and compare behavior, especially error and edge paths.
 
 ---
 
-## 6. 测试代码扁平化建议
+## 5. Code Review Checklist
 
-1. 一个测试聚焦一个行为断言。
-2. 结构保持 `arrange -> act -> assert`，避免条件分支污染断言。
-3. 复用测试 helper 构造输入，避免测试本体过长。
-4. 对外部依赖（DB/Redis/HTTP）使用“不可用则跳过”策略，保证本地可执行性。
+1. Is the main execution path obvious at first glance?
+2. Are invalid branches returned early?
+3. Is there avoidable nesting deeper than 3 levels?
+4. Are loop branches using `continue` where appropriate?
+5. Are batch APIs accidentally implemented as single-call loops?
+6. Is error handling consistent and idiomatic (`?` where suitable)?
+7. Is observability centralized rather than scattered?
 
 ---
 
-## 7. 反例与边界
+## 6. Test Flattening Guidance
 
-应避免：
+1. Keep one primary behavior assertion per test.
+2. Use a linear `arrange -> act -> assert` structure.
+3. Reuse helpers to keep test bodies short.
+4. For external dependencies (DB/Redis/HTTP), use "skip when unavailable" policy for local developer reliability.
 
-1. 为了“扁平”把逻辑拆成大量 1-2 行函数，导致跳转阅读困难。
-2. 用链式函数式调用过度压缩可读性（`map/and_then` 链过长）。
-3. 在未验证行为一致前进行“结构 + 语义”双重改造。
+---
 
-边界说明：
+## 7. Anti-patterns and Boundaries
 
-1. 扁平化不是目标本身；可维护性和正确性优先。
-2. 对性能敏感路径，要在重构后用 benchmark 验证。
+Avoid:
+
+1. Splitting logic into many 1-2 line helpers only for style.
+2. Over-compressing code into hard-to-read combinator chains.
+3. Refactoring structure and semantics at the same time without behavior verification.
+
+Boundary notes:
+
+1. Flattening is not the goal; maintainability and correctness are.
+2. For performance-sensitive paths, validate with benchmarks after refactor.

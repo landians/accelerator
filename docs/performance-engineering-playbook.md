@@ -1,64 +1,65 @@
-# Performance & Engineering Playbook
+# Performance and Engineering Playbook
 
-本手册用于落地迭代 D，覆盖 benchmark 命令清单、完整压测流程、回归门禁、兼容策略和推荐项目结构。
+> Terminology baseline: see [docs/terminology.md](./terminology.md).
 
-相关文件：
+This playbook defines benchmark commands, full load-test workflow, regression gating,
+compatibility policy, and recommended project structure.
 
-1. 基准入口：`benches/cache_path_bench.rs`
-2. 一键脚本：`scripts/bench.sh`
-3. 基线导出：`src/bin/export_bench_baseline.rs`
-4. 回归检测：`src/bin/check_bench_regression.rs`
+Related files:
 
-## 1. 基准测试（criterion）
+1. Benchmark entry: `benches/cache_path_bench.rs`
+2. One-click script: `scripts/bench.sh`
+3. Baseline exporter: `src/bin/export_bench_baseline.rs`
+4. Regression checker: `src/bin/check_bench_regression.rs`
 
-### 1.1 覆盖矩阵
+## 1. Benchmarking (criterion)
 
-当前 benchmark 文件：`benches/cache_path_bench.rs`。
+### 1.1 Coverage matrix
 
-覆盖场景：
+Current benchmark file: `benches/cache_path_bench.rs`
 
-1. 单 key 命中：`single_key/hit/manual` vs `single_key/hit/macro`
-2. 单 key miss 回源：`single_key/miss/manual` vs `single_key/miss/macro`
-3. 批量命中：`batch/hit/manual/32` vs `batch/hit/macro/32`
-4. 批量 miss 回源：`batch/miss/manual/32` vs `batch/miss/macro/32`
+Covered scenarios:
 
-补充说明：
+1. Single-key hit: `single_key/hit/manual` vs `single_key/hit/macro`
+2. Single-key miss with miss load (source-of-truth load): `single_key/miss/manual` vs `single_key/miss/macro`
+3. Batch hit: `batch/hit/manual/32` vs `batch/hit/macro/32`
+4. Batch miss with miss load (source-of-truth load): `batch/miss/manual/32` vs `batch/miss/macro/32`
 
-1. 默认会先跑本地路径（`moka`）。
-2. 当 `ACCELERATOR_BENCH_REDIS_URL` 可用时，还会跑远程路径（Redis）。
-3. 如果 Redis 地址不可用，远程基准可能 panic；可通过 local-only 模式绕过。
+Notes:
 
-### 1.2 运行前准备
+1. Local (`moka`) benchmarks always run first.
+2. Remote (`redis`) benchmarks run when `ACCELERATOR_BENCH_REDIS_URL` is reachable.
+3. If Redis endpoint is invalid/unreachable, remote benchmarks may fail; use local-only mode to bypass.
 
-建议顺序：
+### 1.2 Pre-run checklist
 
-1. 先确保功能正确：`cargo test`
-2. 压测时尽量固定机器状态（接电、关闭大负载后台任务）
-3. 远程基准前确认 Redis 可用（例如 `redis-cli ping`）
+1. Ensure correctness first: `cargo test`
+2. Keep host environment stable (power plugged in, low background load)
+3. Verify Redis availability before remote benchmarks (`redis-cli ping`)
 
-### 1.3 原生命令清单（不走脚本）
+### 1.3 Raw command list (without script)
 
-单次正式基准（推荐）：
+Single formal run:
 
 ```bash
 cargo bench --bench cache_path_bench -- --sample-size=60
 ```
 
-仅跑本地路径（跳过 Redis）：
+Local-only run (skip Redis path):
 
 ```bash
 ACCELERATOR_BENCH_REDIS_URL=redis://127.0.0.1:0 \
 cargo bench --bench cache_path_bench -- --sample-size=60
 ```
 
-指定 Redis 跑远程路径：
+Run with Redis path enabled:
 
 ```bash
 ACCELERATOR_BENCH_REDIS_URL=redis://127.0.0.1:6379 \
 cargo bench --bench cache_path_bench -- --sample-size=60
 ```
 
-重复执行 3 次并落盘日志（排除偶发抖动）：
+Repeat 3 times and save logs:
 
 ```bash
 mkdir -p target/bench-logs
@@ -69,35 +70,35 @@ for i in 1 2 3; do
 done
 ```
 
-执行后，criterion 结果位于 `target/criterion/`。
+Criterion output is stored under `target/criterion/`.
 
-### 1.4 一键脚本命令清单（推荐）
+### 1.4 One-click command list (recommended)
 
-默认一键流程（测试 + local-only 基准 + 回归门禁）：
+Default one-click flow (tests + local-only benchmark + regression gate):
 
 ```bash
 ./scripts/bench.sh
 ```
 
-Redis 流程：
+Redis flow:
 
 ```bash
 ./scripts/bench.sh redis --redis-url redis://127.0.0.1:6379
 ```
 
-仅跑本地基准：
+Local benchmark only:
 
 ```bash
 ./scripts/bench.sh bench-local --runs 3 --sample-size 80
 ```
 
-导出基线（先跑一轮 local-only）：
+Export baseline (after a fresh local-only benchmark run):
 
 ```bash
 ./scripts/bench.sh baseline --run-bench
 ```
 
-只跑回归门禁：
+Regression gate only:
 
 ```bash
 ./scripts/bench.sh regression --threshold 0.10
@@ -105,27 +106,27 @@ Redis 流程：
 
 ---
 
-## 2. 回归门禁
+## 2. Regression Gate
 
-### 2.1 基线导出
+### 2.1 Export baseline
 
 ```bash
 cargo run --bin export_bench_baseline --
 ```
 
-默认输出：`docs/benchmarks/cache_path_bench.json`。
+Default output: `docs/benchmarks/cache_path_bench.json`
 
-### 2.2 阈值校验
+### 2.2 Threshold check
 
 ```bash
 cargo run --bin check_bench_regression -- --threshold 0.15
 ```
 
-- `0.15` 表示允许最多 15% 回退。
-- 脚本会逐项比较当前 mean latency 和基线值。
-- 任一关键项超过阈值即返回非 0（适合接入 CI）。
+- `0.15` means up to 15% slowdown is allowed.
+- The checker compares current mean latency against baseline mean latency.
+- Any key benchmark over threshold returns non-zero exit code (CI friendly).
 
-### 2.3 脚本化回归校验
+### 2.3 Scripted regression check
 
 ```bash
 ./scripts/bench.sh regression --threshold 0.15
@@ -133,97 +134,97 @@ cargo run --bin check_bench_regression -- --threshold 0.15
 
 ---
 
-## 3. 完整压测流程（建议执行顺序）
+## 3. Full Load-Test Workflow (Recommended)
 
-### 3.1 阶段 A：功能与环境检查
+### 3.1 Stage A: correctness and environment
 
-1. `cargo test`
-2. 选择 local-only 还是 redis 模式
-3. 确认压测参数：`sample-size`、`runs`、`threshold`
+1. Run `cargo test`
+2. Choose local-only or Redis mode
+3. Confirm parameters: `sample-size`, `runs`, `threshold`
 
-### 3.2 阶段 B：冒烟压测
+### 3.2 Stage B: smoke benchmark
 
-先跑小样本快速确认链路可用：
+Run a small sample to verify the pipeline quickly:
 
 ```bash
 ./scripts/bench.sh bench-local --sample-size 20
 ```
 
-### 3.3 阶段 C：正式压测
+### 3.3 Stage C: formal benchmark
 
-建议至少 3 轮：
+Use at least 3 runs:
 
 ```bash
 ./scripts/bench.sh bench-local --runs 3 --sample-size 60
 ```
 
-如果需要 Redis 远程路径：
+For Redis remote path:
 
 ```bash
 ./scripts/bench.sh bench-redis --runs 3 --sample-size 60 --redis-url redis://127.0.0.1:6379
 ```
 
-### 3.4 阶段 D：导出或更新基线
+### 3.4 Stage D: update baseline
 
-当确认当前版本可作为新基线时执行：
+After confirming a stable version:
 
 ```bash
 ./scripts/bench.sh baseline --run-bench
 ```
 
-### 3.5 阶段 E：回归判定
+### 3.5 Stage E: gate regression
 
 ```bash
 ./scripts/bench.sh regression --threshold 0.15
 ```
 
-### 3.6 阶段 F：失败处理建议
+### 3.6 Stage F: failure handling
 
-1. 先看是否环境抖动（CPU 占用、温控、后台任务）。
-2. 重跑 2-3 次确认是否稳定复现。
-3. 如仅远程路径失败，先切 local-only 验证主逻辑改动影响。
-4. 再用 profiler 定位热点函数（分配、锁竞争、序列化、网络 I/O）。
-
----
-
-## 4. API 稳定策略
-
-### 4.1 向后兼容规则
-
-1. 对外固定 API（`get/set/del/mget/mset/mdel`）在 minor 版本内不得破坏签名。
-2. 已发布宏参数不得重命名；新增参数必须有默认值。
-3. 变更宏默认行为必须在 changelog 标注并给迁移示例。
-4. 指标名采用稳定前缀 `accelerator_cache_*`，发布后不随意重命名。
-
-### 4.2 破坏性变更模板
-
-每次破坏性变更需附带以下内容：
-
-1. `What changed`：变更点（接口/默认值/行为）。
-2. `Why`：问题背景与收益。
-3. `Impact`：受影响用户范围。
-4. `Migration`：逐步迁移步骤（含旧/新代码对照）。
-5. `Rollback`：回退方案与触发条件。
+1. Check for host noise (CPU contention, thermal throttling, background tasks)
+2. Re-run 2-3 times to verify reproducibility
+3. If only remote path fails, validate local-only first
+4. Use profiler to locate hotspots (allocations, lock contention, serialization, network I/O)
 
 ---
 
-## 5. 推荐项目结构与宏模板
+## 4. API Stability Policy
 
-### 5.1 推荐结构
+### 4.1 Backward compatibility rules
+
+1. Public cache APIs (`get/set/del/mget/mset/mdel`) must remain signature-compatible within minor versions.
+2. Published macro parameters must not be renamed; new parameters must have defaults.
+3. Macro default behavior changes must be documented in changelog with migration examples.
+4. Metric names under `accelerator_cache_*` should remain stable once published.
+
+### 4.2 Breaking change template
+
+Each breaking change should include:
+
+1. `What changed` (interface/default/behavior)
+2. `Why` (problem and expected gain)
+3. `Impact` (who is affected)
+4. `Migration` (step-by-step with before/after code)
+5. `Rollback` (rollback trigger and strategy)
+
+---
+
+## 5. Recommended Project Structure and Macro Template
+
+### 5.1 Recommended layout
 
 ```text
 src/
   cache/
-    user_cache.rs      # LevelCache 构建与配置
+    user_cache.rs      # LevelCache construction and config
   repo/
-    user_repo.rs       # DB 查询与批量查询
+    user_repo.rs       # DB query and batch query
   service/
-    user_service.rs    # 业务方法 + 过程宏注解
+    user_service.rs    # business methods + macro annotations
   api/
     user_handler.rs
 ```
 
-### 5.2 服务层宏模板
+### 5.2 Service-layer macro template
 
 ```rust
 use accelerator::macros::{cache_evict, cache_evict_batch, cache_put, cacheable, cacheable_batch};
@@ -258,10 +259,10 @@ impl UserService {
 
 ---
 
-## 6. 发布前建议清单
+## 6. Pre-release Checklist
 
 1. `cargo test`
 2. `./scripts/bench.sh bench-local --runs 3 --sample-size 60`
 3. `./scripts/bench.sh regression --threshold 0.15`
-4. 检查 `docs/cache-ops-runbook.md` 是否需要更新
-5. 补齐 changelog（包含兼容性与迁移说明）
+4. Review whether `docs/cache-ops-runbook.md` needs updates
+5. Update changelog with compatibility and migration notes
