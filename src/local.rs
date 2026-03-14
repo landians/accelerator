@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use moka::future::Cache;
 
-use crate::backend::StoredEntry;
+use crate::backend::{LocalBackend, StoredEntry};
 use crate::error::CacheResult;
 
 /// Local in-memory backend implemented by `moka::future::Cache`.
@@ -83,6 +83,39 @@ where
             self.del(key).await?;
         }
         Ok(())
+    }
+}
+
+impl<V> LocalBackend<V> for MokaBackend<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
+        MokaBackend::get(self, key).await
+    }
+
+    async fn peek(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
+        MokaBackend::peek(self, key).await
+    }
+
+    async fn mget(&self, keys: &[String]) -> CacheResult<HashMap<String, Option<StoredEntry<V>>>> {
+        MokaBackend::mget(self, keys).await
+    }
+
+    async fn set(&self, key: &str, entry: StoredEntry<V>) -> CacheResult<()> {
+        MokaBackend::set(self, key, entry).await
+    }
+
+    async fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> CacheResult<()> {
+        MokaBackend::mset(self, entries).await
+    }
+
+    async fn del(&self, key: &str) -> CacheResult<()> {
+        MokaBackend::del(self, key).await
+    }
+
+    async fn mdel(&self, keys: &[String]) -> CacheResult<()> {
+        MokaBackend::mdel(self, keys).await
     }
 }
 

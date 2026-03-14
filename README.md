@@ -1,9 +1,9 @@
 # accelerator
 Accelerator is a universal data access acceleration component, designed to enhance the data reading performance and system stability in high-concurrency scenarios.
 
-## Fixed Backend Best Practice
+## Default Backend Best Practice
 
-- Runtime is fixed to `moka` (L1) + `redis` (L2).
+- Runtime defaults to `moka` (L1) + `redis` (L2), and both layers are now pluggable.
 - L1 uses `moka`'s built-in eviction behavior; there is no user-facing `EvictionPolicy` switch.
 - Enhanced capabilities are built-in: `warmup`, `refresh_ahead`, `stale_on_error`, and Redis Pub/Sub invalidation broadcast.
 - Production-style usage example: `examples/fixed_backend_best_practice.rs`.
@@ -14,6 +14,14 @@ cargo run --example fixed_backend_best_practice
 ```
 
 If Redis is not reachable at `ACCELERATOR_REDIS_URL` (default `redis://127.0.0.1:6379`), the example exits gracefully.
+
+### Custom backend integration
+
+To replace default backends:
+
+- Implement `LocalBackend<V>` for your L1 backend.
+- Implement `RemoteBackend<V>` and `InvalidationSubscriber` for your L2 backend.
+- Wire them through `LevelCacheBuilder::local(...)` / `LevelCacheBuilder::remote(...)`.
 
 ## Performance Baseline & Regression Gate
 

@@ -27,7 +27,7 @@ pub mod macros {
 }
 
 /// Re-export of backend storage value types.
-pub use backend::{StoredEntry, StoredValue};
+pub use backend::{InvalidationSubscriber, LocalBackend, RemoteBackend, StoredEntry, StoredValue};
 /// Re-export of core cache API.
 pub use cache::{CacheDiagnosticSnapshot, CacheMetricsSnapshot, LevelCache, ReadOptions};
 /// Re-export of key configuration enums.
@@ -37,9 +37,7 @@ pub use error::{CacheError, CacheResult};
 /// Re-export of loader traits and helpers.
 pub use loader::{FnLoader, Loader, MLoader, NoopLoader};
 /// Re-export of observability helpers.
-pub use observability::{
-    MetricPoint, OtelMetricPoint, metric_points, render_prometheus, to_otel_points,
-};
+pub use observability::{MetricPoint, OtelMetricPoint, metric_points, to_otel_points};
 /// Re-export of optional OTLP telemetry helpers.
 #[cfg(feature = "otlp")]
 pub use telemetry::{OtlpTelemetryBuilder, OtlpTransport, TelemetryGuard, TelemetryInitError};

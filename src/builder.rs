@@ -7,32 +7,42 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::backend::{LocalBackend, RemoteBackend};
 use crate::cache::{KeyConverter, LevelCache};
 use crate::config::{CacheConfig, CacheMode, ReadValueMode};
 use crate::error::{CacheError, CacheResult};
 use crate::loader::{FnLoader, MLoader, NoopLoader};
 use crate::{local, remote};
 
-/// Builder for fixed-backend `LevelCache` instances.
-pub struct LevelCacheBuilder<K, V, LD = NoopLoader>
-where
+/// Builder for `LevelCache` instances with pluggable backends.
+pub struct LevelCacheBuilder<
+    K,
+    V,
+    LD = NoopLoader,
+    LB = local::MokaBackend<V>,
+    RB = remote::RedisBackend<V>,
+> where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     config: CacheConfig,
-    local: Option<local::MokaBackend<V>>,
-    remote: Option<remote::RedisBackend<V>>,
+    local: Option<LB>,
+    remote: Option<RB>,
     loader: Option<LD>,
     key_converter: Option<KeyConverter<K>>,
     _marker: PhantomData<V>,
 }
 
-impl<K, V, LD> Default for LevelCacheBuilder<K, V, LD>
+impl<K, V, LD, LB, RB> Default for LevelCacheBuilder<K, V, LD, LB, RB>
 where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     /// Creates a builder with default config and no backend wiring.
     fn default() -> Self {
@@ -60,11 +70,13 @@ where
     }
 }
 
-impl<K, V, LD> LevelCacheBuilder<K, V, LD>
+impl<K, V, LD, LB, RB> LevelCacheBuilder<K, V, LD, LB, RB>
 where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     /// Creates a new builder with default config.
     pub fn new() -> Self {
@@ -83,16 +95,34 @@ where
         self
     }
 
-    /// Sets the local moka backend instance.
-    pub fn local(mut self, local: local::MokaBackend<V>) -> Self {
-        self.local = Some(local);
-        self
+    /// Sets the local backend instance.
+    pub fn local<NLB>(self, local: NLB) -> LevelCacheBuilder<K, V, LD, NLB, RB>
+    where
+        NLB: LocalBackend<V>,
+    {
+        LevelCacheBuilder {
+            config: self.config,
+            local: Some(local),
+            remote: self.remote,
+            loader: self.loader,
+            key_converter: self.key_converter,
+            _marker: PhantomData,
+        }
     }
 
-    /// Sets the remote redis backend instance.
-    pub fn remote(mut self, remote: remote::RedisBackend<V>) -> Self {
-        self.remote = Some(remote);
-        self
+    /// Sets the remote backend instance.
+    pub fn remote<NRB>(self, remote: NRB) -> LevelCacheBuilder<K, V, LD, LB, NRB>
+    where
+        NRB: RemoteBackend<V>,
+    {
+        LevelCacheBuilder {
+            config: self.config,
+            local: self.local,
+            remote: Some(remote),
+            loader: self.loader,
+            key_converter: self.key_converter,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets local value TTL.
@@ -201,7 +231,7 @@ where
     }
 
     /// Installs a custom loader implementation.
-    pub fn loader<NLD>(self, loader: NLD) -> LevelCacheBuilder<K, V, NLD>
+    pub fn loader<NLD>(self, loader: NLD) -> LevelCacheBuilder<K, V, NLD, LB, RB>
     where
         NLD: MLoader<K, V> + Send + Sync + 'static,
     {
@@ -216,7 +246,10 @@ where
     }
 
     /// Installs a function-style single-key loader.
-    pub fn loader_fn<F, Fut>(self, loader: F) -> LevelCacheBuilder<K, V, FnLoader<K, V, F, Fut>>
+    pub fn loader_fn<F, Fut>(
+        self,
+        loader: F,
+    ) -> LevelCacheBuilder<K, V, FnLoader<K, V, F, Fut>, LB, RB>
     where
         F: Fn(K) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CacheResult<Option<V>>> + Send + 'static,
@@ -225,7 +258,7 @@ where
     }
 
     /// Validates configuration and builds a `LevelCache`.
-    pub fn build(self) -> CacheResult<LevelCache<K, V, LD>> {
+    pub fn build(self) -> CacheResult<LevelCache<K, V, LD, LB, RB>> {
         self.validate()?;
 
         let key_converter = self
@@ -306,11 +339,145 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
+    use crate::backend::{InvalidationSubscriber, LocalBackend, RemoteBackend, StoredEntry};
     use crate::builder::LevelCacheBuilder;
     use crate::config::CacheMode;
+    use crate::error::CacheResult;
     use crate::local;
+
+    #[derive(Clone, Default)]
+    struct FakeLocalBackend;
+
+    impl LocalBackend<String> for FakeLocalBackend {
+        fn get(
+            &self,
+            _key: &str,
+        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
+            async move { Ok(None) }
+        }
+
+        fn peek(
+            &self,
+            _key: &str,
+        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
+            async move { Ok(None) }
+        }
+
+        fn mget(
+            &self,
+            keys: &[String],
+        ) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<String>>>>> + Send
+        {
+            async move {
+                let mut values = HashMap::with_capacity(keys.len());
+                for key in keys {
+                    values.insert(key.clone(), None);
+                }
+                Ok(values)
+            }
+        }
+
+        fn set(
+            &self,
+            _key: &str,
+            _entry: StoredEntry<String>,
+        ) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn mset(
+            &self,
+            _entries: HashMap<String, StoredEntry<String>>,
+        ) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn del(&self, _key: &str) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn mdel(&self, _keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSubscriber;
+
+    impl InvalidationSubscriber for FakeSubscriber {
+        fn next_message(&mut self) -> impl Future<Output = Option<CacheResult<String>>> + Send {
+            async move { None }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRemoteBackend;
+
+    impl RemoteBackend<String> for FakeRemoteBackend {
+        type Subscriber = FakeSubscriber;
+
+        fn get(
+            &self,
+            _key: &str,
+        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
+            async move { Ok(None) }
+        }
+
+        fn mget(
+            &self,
+            keys: &[String],
+        ) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<String>>>>> + Send
+        {
+            async move {
+                let mut values = HashMap::with_capacity(keys.len());
+                for key in keys {
+                    values.insert(key.clone(), None);
+                }
+                Ok(values)
+            }
+        }
+
+        fn set(
+            &self,
+            _key: &str,
+            _entry: StoredEntry<String>,
+        ) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn mset(
+            &self,
+            _entries: HashMap<String, StoredEntry<String>>,
+        ) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn del(&self, _key: &str) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn mdel(&self, _keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn publish(
+            &self,
+            _channel: &str,
+            _payload: &str,
+        ) -> impl Future<Output = CacheResult<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn subscribe(
+            &self,
+            _channel: &str,
+        ) -> impl Future<Output = CacheResult<Self::Subscriber>> + Send {
+            async move { Ok(FakeSubscriber) }
+        }
+    }
 
     #[test]
     fn build_fails_without_required_backends() {
@@ -387,5 +554,16 @@ mod tests {
         };
 
         assert!(format!("{err}").contains("warmup_batch_size"));
+    }
+
+    #[test]
+    fn build_succeeds_with_custom_local_and_remote_backends() {
+        let cache = LevelCacheBuilder::<u64, String>::new()
+            .mode(CacheMode::Both)
+            .local(FakeLocalBackend)
+            .remote(FakeRemoteBackend)
+            .build();
+
+        assert!(cache.is_ok());
     }
 }

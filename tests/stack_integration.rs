@@ -277,10 +277,6 @@ async fn cache_component_works_with_redis_and_postgres_loader() {
     assert_eq!(batch.get(&91_003_u64).cloned().flatten(), None);
     assert_eq!(loader_probe.mload_calls(), 1);
 
-    let prometheus = cache.prometheus_metrics();
-    assert!(prometheus.contains("accelerator_cache_load_total"));
-    assert!(prometheus.contains(&format!("area=\"{area}\"")));
-
     let otel = cache.otel_metric_points();
     assert!(!otel.is_empty());
     assert!(

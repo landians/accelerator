@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -14,7 +13,9 @@ use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::instrument;
 
-use crate::backend::{StoredEntry, StoredValue};
+use crate::backend::{
+    InvalidationSubscriber, LocalBackend, RemoteBackend, StoredEntry, StoredValue,
+};
 use crate::config::{CacheConfig, CacheMode};
 use crate::error::{CacheError, CacheResult};
 use crate::loader::{MLoader, NoopLoader};
@@ -146,19 +147,26 @@ struct InvalidationMessage {
     keys: Vec<String>,
 }
 
-/// Fixed-backend multi-level cache (Moka + Redis).
-pub struct LevelCache<K, V, LD = NoopLoader>
-where
+/// Multi-level cache with pluggable local/remote backends.
+pub struct LevelCache<
+    K,
+    V,
+    LD = NoopLoader,
+    LB = local::MokaBackend<V>,
+    RB = remote::RedisBackend<V>,
+> where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     /// Runtime cache configuration.
     pub(crate) config: CacheConfig,
     /// Local in-memory backend (optional by mode).
-    pub(crate) local: Option<local::MokaBackend<V>>,
+    pub(crate) local: Option<LB>,
     /// Remote redis backend (optional by mode).
-    pub(crate) remote: Option<remote::RedisBackend<V>>,
+    pub(crate) remote: Option<RB>,
     /// Source-of-truth loader.
     pub(crate) loader: Option<LD>,
     /// Business-key encoder.
@@ -173,17 +181,19 @@ where
     invalidation_listener_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl<K, V, LD> LevelCache<K, V, LD>
+impl<K, V, LD, LB, RB> LevelCache<K, V, LD, LB, RB>
 where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     /// Creates a cache instance from builder-wired components.
     pub(crate) fn new(
         config: CacheConfig,
-        local: Option<local::MokaBackend<V>>,
-        remote: Option<remote::RedisBackend<V>>,
+        local: Option<LB>,
+        remote: Option<RB>,
         loader: Option<LD>,
         key_converter: KeyConverter<K>,
     ) -> Self {
@@ -225,11 +235,6 @@ where
                 .should_start_invalidation_listener()
                 .then(|| self.invalidation_channel()),
         }
-    }
-
-    /// Exports metrics as Prometheus text with `area` label.
-    pub fn prometheus_metrics(&self) -> String {
-        crate::observability::render_prometheus(&self.config.area, &self.metrics_snapshot())
     }
 
     /// Exports metrics as OpenTelemetry-friendly point list.
@@ -623,8 +628,8 @@ where
 
     /// Runs resilient redis subscription loop and applies local invalidations.
     async fn run_invalidation_listener(
-        local: local::MokaBackend<V>,
-        remote: remote::RedisBackend<V>,
+        local: LB,
+        remote: RB,
         channel: String,
         metrics: Arc<CacheMetrics>,
     ) {
@@ -633,8 +638,8 @@ where
         retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
-            let mut pubsub = match remote.subscribe(&channel).await {
-                Ok(pubsub) => pubsub,
+            let mut subscriber = match remote.subscribe(&channel).await {
+                Ok(subscriber) => subscriber,
                 Err(_) => {
                     metrics
                         .invalidation_receive_failures
@@ -644,9 +649,8 @@ where
                 }
             };
 
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = stream.next().await {
-                let payload = match msg.get_payload::<String>() {
+            while let Some(payload) = subscriber.next_message().await {
+                let payload = match payload {
                     Ok(payload) => payload,
                     Err(_) => {
                         metrics
@@ -1073,7 +1077,7 @@ where
 
     /// Writes one key into local backend with ttl/null policy.
     async fn write_local(
-        local: &Option<local::MokaBackend<V>>,
+        local: &Option<LB>,
         config: &CacheConfig,
         encoded_key: &str,
         value: Option<V>,
@@ -1102,7 +1106,7 @@ where
 
     /// Writes one key into remote backend with ttl/null policy.
     async fn write_remote(
-        remote: &Option<remote::RedisBackend<V>>,
+        remote: &Option<RB>,
         config: &CacheConfig,
         encoded_key: &str,
         value: Option<V>,
@@ -1205,11 +1209,13 @@ where
     }
 }
 
-impl<K, V, LD> Drop for LevelCache<K, V, LD>
+impl<K, V, LD, LB, RB> Drop for LevelCache<K, V, LD, LB, RB>
 where
     K: Clone + Eq + Hash + ToString + Send + Sync + 'static,
     V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     LD: MLoader<K, V> + Send + Sync + 'static,
+    LB: LocalBackend<V>,
+    RB: RemoteBackend<V>,
 {
     /// Aborts background invalidation task when cache instance is dropped.
     fn drop(&mut self) {
@@ -1237,7 +1243,7 @@ mod tests {
     fn test_cache_builder() -> TestBuilder {
         let local_backend = local::moka::<String>().max_capacity(1024).build().unwrap();
 
-        LevelCacheBuilder::new()
+        LevelCacheBuilder::<u64, String>::new()
             .area("test")
             .mode(CacheMode::Local)
             .local(local_backend)
@@ -1520,9 +1526,6 @@ mod tests {
         let cache = test_cache_builder().area("metric-area").build().unwrap();
         cache.set(&9, Some("v9".to_string())).await.unwrap();
         let _ = cache.get(&9, &ReadOptions::default()).await.unwrap();
-
-        let text = cache.prometheus_metrics();
-        assert!(text.contains("accelerator_cache_local_hit_total{area=\"metric-area\"}"));
 
         let otel_points = cache.otel_metric_points();
         assert_eq!(otel_points.len(), 16);

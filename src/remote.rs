@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use redis::AsyncCommands;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::backend::{StoredEntry, StoredValue};
+use crate::backend::{InvalidationSubscriber, RemoteBackend, StoredEntry, StoredValue};
 use crate::error::{CacheError, CacheResult};
 
 // Redis GET/MGET responses do not include per-key TTL metadata.
@@ -226,6 +227,74 @@ where
             .await
             .map_err(|err| CacheError::Backend(format!("redis MDEL failed: {err}")))?;
         Ok(())
+    }
+}
+
+/// Adapter around Redis Pub/Sub for invalidation stream consumption.
+pub struct RedisSubscriber {
+    pubsub: redis::aio::PubSub,
+}
+
+impl RedisSubscriber {
+    fn new(pubsub: redis::aio::PubSub) -> Self {
+        Self { pubsub }
+    }
+}
+
+impl InvalidationSubscriber for RedisSubscriber {
+    async fn next_message(&mut self) -> Option<CacheResult<String>> {
+        let msg = {
+            let mut stream = self.pubsub.on_message();
+            stream.next().await
+        };
+
+        let Some(msg) = msg else {
+            return None;
+        };
+
+        Some(msg.get_payload::<String>().map_err(|err| {
+            CacheError::Backend(format!("redis pubsub payload decode failed: {err}"))
+        }))
+    }
+}
+
+impl<V> RemoteBackend<V> for RedisBackend<V>
+where
+    V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    type Subscriber = RedisSubscriber;
+
+    async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
+        RedisBackend::get(self, key).await
+    }
+
+    async fn mget(&self, keys: &[String]) -> CacheResult<HashMap<String, Option<StoredEntry<V>>>> {
+        RedisBackend::mget(self, keys).await
+    }
+
+    async fn set(&self, key: &str, entry: StoredEntry<V>) -> CacheResult<()> {
+        RedisBackend::set(self, key, entry).await
+    }
+
+    async fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> CacheResult<()> {
+        RedisBackend::mset(self, entries).await
+    }
+
+    async fn del(&self, key: &str) -> CacheResult<()> {
+        RedisBackend::del(self, key).await
+    }
+
+    async fn mdel(&self, keys: &[String]) -> CacheResult<()> {
+        RedisBackend::mdel(self, keys).await
+    }
+
+    async fn publish(&self, channel: &str, payload: &str) -> CacheResult<()> {
+        RedisBackend::publish(self, channel, payload).await
+    }
+
+    async fn subscribe(&self, channel: &str) -> CacheResult<Self::Subscriber> {
+        let pubsub = RedisBackend::subscribe(self, channel).await?;
+        Ok(RedisSubscriber::new(pubsub))
     }
 }
 

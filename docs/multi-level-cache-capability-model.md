@@ -10,23 +10,23 @@
 ## 2. 设计原则
 
 1. **先抽象后实现**：先定义能力模型与契约，再选择具体库（如 `moka`、`redis`）。
-2. **固定后端优先**：本项目落地版默认固定 `moka`（L1）+ `redis`（L2），优先保证主路径可读性与稳定性。
+2. **默认后端优先**：本项目默认使用 `moka`（L1）+ `redis`（L2），同时开放后端替换能力，优先保证主路径可读性与稳定性。
 3. **Rust 约束明确**：默认 Rust 2024 Edition；实现层禁止 `unsafe`（除非经过 ADR 单独评审）。
 4. **默认安全一致**：默认策略优先保证数据正确性与可解释性，再优化极限性能。
-5. **异步友好**：运行时 API 直接使用原生 `async fn`，Loader 接口使用原生 `async fn in trait`，不使用 `async_trait`。
+5. **异步友好**：运行时 API 直接使用原生 `async fn`，trait 接口统一使用 `fn -> impl Future`，不使用 `async_trait`。
 6. **可观测先行**：每个关键路径都必须有指标、日志、追踪字段。
 7. **渐进式能力增强**：MVP 可先覆盖读写/回源，后续再叠加刷新、广播失效、注解宏。
 8. **静态分发优先**：运行时不依赖 `dyn` 后端对象；通过泛型在编译期完成分发。
 
 ### 2.1 当前实现落地约束（MVP）
 
-1. 对外主类型为 `LevelCache<K, V, LD>`，后端固定为 `moka`（L1）+ `redis`（L2）。
-2. Builder 主入口为 `LevelCacheBuilder<K, V>`，不再提供后端替换入口。
+1. 对外主类型为 `LevelCache<K, V, LD, LB, RB>`，其中 `LB/RB` 默认分别为 `moka` 与 `redis` 实现。
+2. Builder 主入口为 `LevelCacheBuilder<K, V, LD, LB, RB>`，可通过 `.local(...)` / `.remote(...)` 替换后端。
 3. `get/mget` 默认 miss 自动回源；仅在 `ReadOptions.disable_load=true` 或未配置 loader 时跳过回源。
 4. `mget` 返回 `HashMap<K, Option<V>>`，保证覆盖全部请求 key。
 5. singleflight 固定使用 `singleflight-async`，不再引入 provider 抽象层。
 6. `ttl_jitter_ratio` 已落地（默认 `0.1`），用于错峰过期，降低雪崩风险。
-7. L1 淘汰行为固定为 `moka` 原生策略，不暴露 LRU/LFU/WTinyLFU 切换配置。
+7. 默认 L1 采用 `moka` 原生淘汰策略，不暴露 LRU/LFU/WTinyLFU 切换配置。
 8. 内置基础观测：`LevelCache::metrics_snapshot()` + `tracing` span（`cache.get/mget/set/del/load`）。
 9. 已实现增强能力：`warmup`、`refresh_ahead`、`stale_on_error`、Redis Pub/Sub 失效广播。
 
@@ -81,13 +81,13 @@
 ## 5. 抽象接口模型
 
 本节给出“能力边界 + 契约语义 + 推荐类型结构”。  
-本版本是**彻底固定后端**实现：运行时固定 `moka` + `redis`，对外暴露最终 API，不再暴露可替换后端 trait。
+当前版本是**默认后端 + 可替换后端**模型：运行时默认 `moka` + `redis`，并开放后端 trait 以支持扩展。
 
 ### 5.1 接口分层与职责
 
-1. **Storage 层（固定实现）**  
-   - `MokaBackend<V>`：本地缓存，提供 `get/mget/set/mset/del/mdel`。
-   - `RedisBackend<V>`：远端缓存，提供 `get/mget/set/mset/del/mdel`。
+1. **Storage 层（抽象 + 默认实现）**  
+   - `LocalBackend<V>` / `RemoteBackend<V>`：本地/远端缓存抽象。
+   - `MokaBackend<V>` / `RedisBackend<V>`：默认实现。
 2. **Orchestration 层（统一编排）**  
    - `LevelCache<K, V, LD>`：统一处理 L1/L2 路由、回填、回源、singleflight。
 3. **Loader 层（可插拔回源）**  
@@ -154,29 +154,34 @@ pub struct CacheConfig {
 2. **SharedArc（预留）**：用于只读大对象优化；若值包含 interior mutability，需由业务自行保证语义正确。
 3. 当前版本不再暴露 `copy_on_read/copy_on_write` 开关，避免“配置存在但主流程未生效”的误导。
 
-### 5.4 固定后端接口（不再抽象 trait）
+### 5.4 后端抽象接口
 
 ```rust
-pub struct MokaBackend<V> { /* ... */ }
-
-impl<V> MokaBackend<V> {
-    pub async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>>;
-    pub async fn mget(&self, keys: &[String]) -> CacheResult<HashMap<String, Option<StoredEntry<V>>>>;
-    pub async fn set(&self, key: &str, entry: StoredEntry<V>) -> CacheResult<()>;
-    pub async fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> CacheResult<()>;
-    pub async fn del(&self, key: &str) -> CacheResult<()>;
-    pub async fn mdel(&self, keys: &[String]) -> CacheResult<()>;
+pub trait LocalBackend<V>: Clone + Send + Sync + 'static {
+    fn get(&self, key: &str) -> impl Future<Output = CacheResult<Option<StoredEntry<V>>>> + Send;
+    fn peek(&self, key: &str) -> impl Future<Output = CacheResult<Option<StoredEntry<V>>>> + Send;
+    fn mget(&self, keys: &[String]) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<V>>>>> + Send;
+    fn set(&self, key: &str, entry: StoredEntry<V>) -> impl Future<Output = CacheResult<()>> + Send;
+    fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> impl Future<Output = CacheResult<()>> + Send;
+    fn del(&self, key: &str) -> impl Future<Output = CacheResult<()>> + Send;
+    fn mdel(&self, keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send;
 }
 
-pub struct RedisBackend<V> { /* ... */ }
+pub trait InvalidationSubscriber: Send {
+    fn next_message(&mut self) -> impl Future<Output = Option<CacheResult<String>>> + Send;
+}
 
-impl<V> RedisBackend<V> {
-    pub async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>>;
-    pub async fn mget(&self, keys: &[String]) -> CacheResult<HashMap<String, Option<StoredEntry<V>>>>;
-    pub async fn set(&self, key: &str, entry: StoredEntry<V>) -> CacheResult<()>;
-    pub async fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> CacheResult<()>;
-    pub async fn del(&self, key: &str) -> CacheResult<()>;
-    pub async fn mdel(&self, keys: &[String]) -> CacheResult<()>;
+pub trait RemoteBackend<V>: Clone + Send + Sync + 'static {
+    type Subscriber: InvalidationSubscriber + Send + 'static;
+
+    fn get(&self, key: &str) -> impl Future<Output = CacheResult<Option<StoredEntry<V>>>> + Send;
+    fn mget(&self, keys: &[String]) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<V>>>>> + Send;
+    fn set(&self, key: &str, entry: StoredEntry<V>) -> impl Future<Output = CacheResult<()>> + Send;
+    fn mset(&self, entries: HashMap<String, StoredEntry<V>>) -> impl Future<Output = CacheResult<()>> + Send;
+    fn del(&self, key: &str) -> impl Future<Output = CacheResult<()>> + Send;
+    fn mdel(&self, keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send;
+    fn publish(&self, channel: &str, payload: &str) -> impl Future<Output = CacheResult<()>> + Send;
+    fn subscribe(&self, channel: &str) -> impl Future<Output = CacheResult<Self::Subscriber>> + Send;
 }
 ```
 
@@ -188,29 +193,24 @@ impl<V> RedisBackend<V> {
 
 ### 5.5 回源与编排接口
 
-Loader 接口改为**原生 `async fn trait`**（不使用 `async_trait`）：
+Loader 接口使用**`fn -> impl Future`**（不使用 `async_trait`）：
 
 ```rust
-#[allow(async_fn_in_trait)]
 pub trait Loader<K, V>: Send + Sync {
-    async fn load(&self, key: &K) -> CacheResult<Option<V>>;
+    fn load(&self, key: &K) -> impl Future<Output = CacheResult<Option<V>>> + Send;
 }
 
-#[allow(async_fn_in_trait)]
-pub trait MLoader<K, V>: Loader<K, V>
-where
-    K: Eq + Hash + Clone,
-{
-    async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>>;
+pub trait MLoader<K, V>: Loader<K, V> {
+    fn mload(&self, keys: &[K]) -> impl Future<Output = CacheResult<HashMap<K, Option<V>>>> + Send;
 }
 ```
 
 编排层对外只暴露最终结构体：
 
 ```rust
-pub struct LevelCache<K, V, LD = NoopLoader> { /* ... */ }
+pub struct LevelCache<K, V, LD = NoopLoader, LB = MokaBackend<V>, RB = RedisBackend<V>> { /* ... */ }
 
-impl<K, V, LD> LevelCache<K, V, LD> {
+impl<K, V, LD, LB, RB> LevelCache<K, V, LD, LB, RB> {
     pub async fn get(&self, key: &K, opts: &ReadOptions) -> CacheResult<Option<V>>;
     pub async fn mget(&self, keys: &[K], opts: &ReadOptions) -> CacheResult<HashMap<K, Option<V>>>;
     pub async fn set(&self, key: &K, value: Option<V>) -> CacheResult<()>;
@@ -225,7 +225,7 @@ impl<K, V, LD> LevelCache<K, V, LD> {
 Builder：
 
 ```rust
-pub struct LevelCacheBuilder<K, V, LD = NoopLoader> { /* ... */ }
+pub struct LevelCacheBuilder<K, V, LD = NoopLoader, LB = MokaBackend<V>, RB = RedisBackend<V>> { /* ... */ }
 ```
 
 行为约束：
@@ -250,11 +250,11 @@ pub struct LevelCacheBuilder<K, V, LD = NoopLoader> { /* ... */ }
 2. 仅在 miss 且需要回源时进入 singleflight；命中路径不得经过 singleflight。
 3. singleflight 仅负责去重，不替代超时、熔断、降级策略。
 
-### 5.6 扩展接口（规划项）
+### 5.6 扩展接口（已开放）
 
-当前版本不对外开放“后端插件”接口；扩展方向主要是：
+当前版本已对外开放后端替换接口；扩展方向主要是：
 
-1. 失效广播（Pub/Sub / Stream）。
+1. 后端适配（如 Memcached/Etcd/自研 KV）。
 2. Codec 插件（json/bincode/custom）。
 3. 观测插件（metrics/tracing hooks）。
 
@@ -274,11 +274,62 @@ pub enum CacheError {
 - 错误要能映射到指标标签（`kind`/`op`）。
 - 保留可读错误上下文（后端操作名、超时来源）。
 
-### 5.8 Async 选型约定（固定版）
+### 5.8 Async 选型约定
 
 1. 对外核心 API（`LevelCache`、`MokaBackend`、`RedisBackend`）使用原生 `async fn`。
-2. Loader trait 使用原生 `async fn in trait`，并显式 `#[allow(async_fn_in_trait)]`。
+2. trait（`Loader`、`MLoader`、`LocalBackend`、`RemoteBackend`）使用 `fn -> impl Future`。
 3. 不使用 `async_trait`，不引入动态分发包装。
+
+实现建议（统一风格）：
+
+1. 在 trait 的具体实现中，优先直接写 `async fn`，可读性更好。
+2. `async fn` 会自动满足 `fn -> impl Future` 的 trait 签名（前提是返回 future 满足 `Send` 约束）。
+3. 若存在同名固有方法，建议使用 `TypeName::method(self, ...)` 调用，避免递归误调到 trait 方法本身。
+
+示例（推荐实现风格）：
+
+```rust
+impl<V> LocalBackend<V> for MokaBackend<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
+        MokaBackend::get(self, key).await
+    }
+}
+```
+
+```rust
+impl InvalidationSubscriber for RedisSubscriber {
+    async fn next_message(&mut self) -> Option<CacheResult<String>> {
+        let msg = {
+            let mut stream = self.pubsub.on_message();
+            stream.next().await
+        };
+        let msg = msg?;
+
+        Some(msg.get_payload::<String>().map_err(|err| {
+            CacheError::Backend(format!("redis pubsub payload decode failed: {err}"))
+        }))
+    }
+}
+
+impl<V> RemoteBackend<V> for RedisBackend<V>
+where
+    V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    type Subscriber = RedisSubscriber;
+
+    async fn get(&self, key: &str) -> CacheResult<Option<StoredEntry<V>>> {
+        RedisBackend::get(self, key).await
+    }
+
+    async fn subscribe(&self, channel: &str) -> CacheResult<Self::Subscriber> {
+        let pubsub = RedisBackend::subscribe(self, channel).await?;
+        Ok(RedisSubscriber::new(pubsub))
+    }
+}
+```
 
 ### 5.9 接口语义总表
 
@@ -304,7 +355,7 @@ pub enum CacheError {
 5. 空值缓存（可配置开关与 TTL）。
 6. `get/mget` 在配置 loader 时默认 miss 自动回源（可通过 `ReadOptions.disable_load` 关闭）。
 7. 值语义配置（copy-on-read/copy-on-write/shared-arc）。
-8. L1 由 `moka` 固定实现与固定淘汰行为，不对外开放策略切换。
+8. 默认 L1 使用 `moka`，可替换后端需保持与默认实现一致的语义契约。
 
 ### L1：高并发稳定性（MVP 强烈建议）
 
@@ -450,12 +501,12 @@ sequenceDiagram
 2. 不将内部 `Mutex/RwLock/RefCell` 暴露给上层做写操作。
 3. 文档中声明“返回的是共享视图，不保证业务快照隔离”。
 
-### 9.2 缓存淘汰策略（固定语义）
+### 9.2 缓存淘汰策略（默认语义）
 
-当前版本遵循“彻底固定后端”原则：
+当前版本遵循“默认后端 + 可替换后端”原则：
 
-- L1 固定为 `moka`，本组件只暴露容量相关配置（如 `max_capacity`），不提供淘汰策略枚举切换。
-- L2 固定为 Redis，淘汰行为由 Redis 服务端 `maxmemory-policy` 决定。
+- 默认 L1 为 `moka`，本组件只暴露容量相关配置（如 `max_capacity`），不提供淘汰策略枚举切换。
+- 默认 L2 为 Redis，淘汰行为由 Redis 服务端 `maxmemory-policy` 决定。
 - 组件侧只保证 TTL 与读写路径语义，不对 Redis 全局淘汰策略做运行时接管。
 
 工程建议：
@@ -480,10 +531,9 @@ sequenceDiagram
 - `invalidation_publish` / `invalidation_publish_failures`
 - `invalidation_receive` / `invalidation_receive_failures`
 
-同时提供两种开箱导出适配：
+当前提供的开箱导出适配：
 
-1. `LevelCache::prometheus_metrics()`：直接导出 Prometheus text 格式（带 `area` label）。
-2. `LevelCache::otel_metric_points()`：导出 OpenTelemetry 友好的点位结构（`name/value/attributes`）。
+1. `LevelCache::otel_metric_points()`：导出 OpenTelemetry 友好的点位结构（`name/value/attributes`）。
 
 稳定指标名统一前缀：`accelerator_cache_*`（例如 `accelerator_cache_local_hit_total`）。
 
@@ -539,7 +589,7 @@ sequenceDiagram
 
 ## 11. 扩展点模型
 
-1. **存储后端扩展（后续）**：当前版本固定 `moka+redis`，若未来需要扩展到 Memcached/Etcd，将新增单独适配层而非直接开放通用后端 trait。
+1. **存储后端扩展（进行中）**：当前默认 `moka+redis`，可通过实现 `LocalBackend/RemoteBackend` 扩展到 Memcached/Etcd 等后端。
 2. **编码扩展**：可插拔 `Codec`，支持性能与可读性取舍。
 3. **键策略扩展**：不同业务可实现自定义 `KeyConverter`。
 4. **失效通道扩展**：Pub/Sub、消息队列、CDC 事件。
@@ -622,18 +672,19 @@ sequenceDiagram
 
 ---
 
-## 16. Crate 对外使用模型（固定后端）
+## 16. Crate 对外使用模型（默认后端 + 可替换）
 
 本节补充“作为一个对外 crate，业务方如何真正接入”。
 
 ### 16.1 对外 API 形态
 
-当前版本只暴露固定后端运行时能力，不暴露后端抽象扩展点：
+当前版本默认提供 `moka + redis` 运行时能力，同时开放后端抽象扩展点：
 
 - `LevelCacheBuilder<K, V>`：构建入口。
-- `LevelCache<K, V, LD>`：最终缓存运行时。
+- `LevelCache<K, V, LD, LB, RB>`：最终缓存运行时（`LB/RB` 有默认类型）。
 - `local::moka::<V>()`：L1 构建器。
 - `remote::redis::<V>()`：L2 构建器。
+- `LocalBackend` / `RemoteBackend` / `InvalidationSubscriber`：后端扩展契约。
 - `Loader` / `MLoader` / `FnLoader`：回源能力。
 - `CacheMetricsSnapshot`：运行时指标快照。
 
@@ -645,7 +696,7 @@ use accelerator::cache::ReadOptions;
 use accelerator::config::{CacheMode, ReadValueMode};
 ```
 
-### 16.2 Builder 最佳实践（固定后端）
+### 16.2 Builder 最佳实践（默认后端）
 
 仓库中可直接运行的示例：`examples/fixed_backend_best_practice.rs`。
 
@@ -804,7 +855,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2) 初始化 Loader（把 Repo 嵌入缓存回源协议）
     let loader = UserRepoLoader::new(repo.clone());
 
-    // 3) 初始化固定后端（moka + redis）
+    // 3) 初始化默认后端（moka + redis）
     let l1 = local::moka::<User>().max_capacity(100_000).build()?;
     let l2 = remote::redis::<User>()
         .url(redis_url)
@@ -1369,7 +1420,7 @@ async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
 
 交付项：
 
-1. 指标出口能力（Prometheus/OpenTelemetry 适配）：
+1. 指标出口能力（OpenTelemetry 适配）：
    - 将 `metrics_snapshot` 结构化映射为稳定指标命名
 2. 关键事件日志标准化：
    - 统一字段：`area/op/key_hash/result/latency_ms/error_kind`
@@ -1386,7 +1437,7 @@ async fn get_user(&self, user_id: u64) -> CacheResult<Option<User>> {
 
 当前状态（2026-03-07）：
 
-1. [x] 指标出口适配已提供（`prometheus_metrics` / `otel_metric_points`）。
+1. [x] 指标出口适配已提供（`otel_metric_points`）。
 2. [x] 关键操作日志字段已统一（`area/op/key_hash/result/latency_ms/error_kind`）。
 3. [x] 运行时诊断接口已提供（`diagnostic_snapshot`）。
 4. [x] 运维排障手册已补充（`docs/cache-ops-runbook.md`）。

@@ -15,7 +15,7 @@
 3. 批量命中：`batch/hit/manual/32` vs `batch/hit/macro/32`
 4. 批量 miss 回源：`batch/miss/manual/32` vs `batch/miss/macro/32`
 
-> 当前 benchmark 默认走本地固定后端（moka），用于观察宏展开路径和手写路径的相对开销。
+> 当前 benchmark 默认走本地后端 `moka`，用于观察宏展开路径和手写路径的相对开销。
 
 ### 1.2 运行方式
 

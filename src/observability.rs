@@ -90,23 +90,6 @@ pub fn metric_points(snapshot: &CacheMetricsSnapshot) -> Vec<MetricPoint> {
     ]
 }
 
-/// Renders Prometheus text format with a single `area` label.
-pub fn render_prometheus(area: &str, snapshot: &CacheMetricsSnapshot) -> String {
-    let mut out = String::new();
-    let area = escape_prometheus_label(area);
-
-    for point in metric_points(snapshot) {
-        out.push_str(point.name);
-        out.push_str("{area=\"");
-        out.push_str(&area);
-        out.push_str("\"} ");
-        out.push_str(&point.value.to_string());
-        out.push('\n');
-    }
-
-    out
-}
-
 /// Converts metrics snapshot into OpenTelemetry-friendly points.
 pub fn to_otel_points(area: &str, snapshot: &CacheMetricsSnapshot) -> Vec<OtelMetricPoint> {
     metric_points(snapshot)
@@ -119,25 +102,11 @@ pub fn to_otel_points(area: &str, snapshot: &CacheMetricsSnapshot) -> Vec<OtelMe
         .collect()
 }
 
-/// Escapes `\\`, `"`, and line breaks according to Prometheus text format rules.
-fn escape_prometheus_label(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use crate::cache::CacheMetricsSnapshot;
 
-    use super::{metric_points, render_prometheus, to_otel_points};
+    use super::{metric_points, to_otel_points};
 
     #[test]
     fn metric_points_returns_stable_metric_set() {
@@ -170,19 +139,6 @@ mod tests {
             "accelerator_cache_invalidation_receive_failures_total"
         );
         assert_eq!(points[15].value, 16);
-    }
-
-    #[test]
-    fn render_prometheus_contains_area_label_and_values() {
-        let snapshot = CacheMetricsSnapshot {
-            local_hit: 9,
-            ..CacheMetricsSnapshot::default()
-        };
-
-        let text = render_prometheus("demo\"area", &snapshot);
-
-        assert!(text.contains("accelerator_cache_local_hit_total{area=\"demo\\\"area\"} 9"));
-        assert!(text.contains("accelerator_cache_remote_miss_total{area=\"demo\\\"area\"} 0"));
     }
 
     #[test]

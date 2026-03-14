@@ -71,7 +71,7 @@ export ACCELERATOR_TEST_POSTGRES_DSN="postgres://accelerator:accelerator@127.0.0
 1. 使用 `sqlx` + Postgres Loader 回源（单 key 与批量）。
 2. 缓存命中后避免重复回源。
 3. `mget` 在 miss 场景回源并回写缓存。
-4. 导出 `prometheus_metrics` 与 `otel_metric_points` 验证可观测输出。
+4. 导出 `otel_metric_points` 验证可观测输出。
 
 ## 3. ClickStack 查看链路与指标
 

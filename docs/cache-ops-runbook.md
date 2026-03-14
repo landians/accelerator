@@ -1,6 +1,6 @@
 # Cache Ops Runbook
 
-本手册用于固定后端版本（moka + redis）的线上排障，优先覆盖迭代 C 目标中的高频故障。
+本手册用于默认后端组合（moka + redis）的线上排障，也适用于实现了等价语义的自定义后端。
 
 ## 1. Redis 不可达
 
@@ -80,7 +80,7 @@
 建议在管理接口暴露以下只读信息：
 
 1. `diagnostic_snapshot()` 输出（配置 + counters + runtime flags）。
-2. `prometheus_metrics()` 输出（便于现场抓取）。
+2. `otel_metric_points()` 输出（便于接入 OTel 指标管道）。
 3. 最近一段 `accelerator::ops` 日志（按 `area/op/key_hash/error_kind` 聚合）。
 
 该入口应只读，不提供线上动态改配置能力。
