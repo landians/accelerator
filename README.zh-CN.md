@@ -2,18 +2,146 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`accelerator` 是一个可插拔、异步优先的 Rust 多级缓存组件，面向高并发服务场景。
-默认后端为本地缓存（L1: `moka`）+ 远程缓存（L2: `redis`），并支持自定义后端替换。
+Accelerator 是一个可插拔、异步优先的 Rust 多级缓存运行时，面向高并发服务场景。
+它提供统一的本地缓存（L1）+ 远程缓存（L2）访问 API，内置回源加载（Miss load）、批量加载、失效广播与可观测能力。
 
 ## 🚀 核心能力
 
-- 多级模式：`Local`、`Remote`、`Both`
-- 统一 API：`get`、`mget`、`set`、`mset`、`del`、`mdel`、`warmup`
-- 回源协议：`Loader<K, V>` + `MLoader<K, V>`
-- 稳定性策略：空值缓存、TTL 抖动、提前刷新、陈旧值回退
-- 一致性策略：Redis Pub/Sub 失效广播
-- 可观测性：`metrics_snapshot`、`diagnostic_snapshot`、`otel_metric_points`
-- 宏支持：`cacheable`、`cacheable_batch`、`cache_put`、`cache_evict`、`cache_evict_batch`
+- 🧭 多级模式：`Local`、`Remote`、`Both`
+- 🧱 默认后端：`moka`（L1）+ `redis`（L2）
+- 🔌 可替换后端 trait：
+  - `LocalBackend<V>`
+  - `RemoteBackend<V>`
+  - `InvalidationSubscriber`
+- 🍱 统一运行时 API：
+  - `get`、`mget`、`set`、`mset`、`del`、`mdel`、`warmup`
+- 📥 回源协议：
+  - 单 key：`Loader<K, V>`
+  - 批量：`MLoader<K, V>`
+- 🛡️ miss 处理：
+  - 单 key miss 可启用 singleflight 去重（`penetration_protect`）
+  - 批量 miss（`mget`）直接走 `MLoader::mload`
+- 🔄 稳定性能力：
+  - 空值缓存（`cache_null_value`、`null_ttl`）
+  - TTL 抖动（`ttl_jitter_ratio`）
+  - 提前刷新（`refresh_ahead`）
+  - 陈旧值回退（`stale_on_error`）
+- 📡 跨实例本地缓存一致性：
+  - Redis Pub/Sub 失效广播
+- 👀 可观测性：
+  - 运行时计数（`metrics_snapshot`）
+  - 诊断快照（`diagnostic_snapshot`）
+  - OTel 友好指标点（`otel_metric_points`）
+  - 核心链路 tracing spans
+- 🪄 过程宏：
+  - `cacheable`、`cacheable_batch`、`cache_put`、`cache_evict`、`cache_evict_batch`
+
+## 📋 目录
+
+- [📦 安装](#-安装)
+- [🤠 快速开始](#-快速开始)
+- [🍱 API 概览](#-api-概览)
+- [🧩 宏使用说明](#-宏使用说明)
+- [🏗️ 后端扩展](#️-后端扩展)
+- [🪄 示例](#-示例)
+- [🏎️ Benchmark 与回归门禁](#️-benchmark-与回归门禁)
+- [🧪 集成测试](#-集成测试)
+- [🧰 本地全栈联调](#-本地全栈联调)
+- [📚 文档导航](#-文档导航)
+
+## 📦 安装
+
+本地 workspace 依赖方式：
+
+```toml
+[dependencies]
+accelerator = { path = "/path/to/accelerator" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+如果通过 registry 发布/使用，请替换为对应版本号。
+
+## 🤠 快速开始
+
+### 仅本地缓存（L1 = moka）
+
+```rust
+use std::time::Duration;
+
+use accelerator::builder::LevelCacheBuilder;
+use accelerator::config::CacheMode;
+use accelerator::{ReadOptions, local};
+
+#[tokio::main]
+async fn main() -> accelerator::CacheResult<()> {
+    let local_backend = local::moka::<String>().max_capacity(100_000).build()?;
+
+    let cache = LevelCacheBuilder::<u64, String>::new()
+        .area("user")
+        .mode(CacheMode::Local)
+        .local(local_backend)
+        .local_ttl(Duration::from_secs(60))
+        .null_ttl(Duration::from_secs(10))
+        .loader_fn(|id: u64| async move { Ok(Some(format!("user-{id}"))) })
+        .build()?;
+
+    let v = cache.get(&42, &ReadOptions::default()).await?;
+    assert_eq!(v, Some("user-42".to_string()));
+    Ok(())
+}
+```
+
+### 双层缓存（L1 + L2）
+
+```rust
+use std::time::Duration;
+
+use accelerator::builder::LevelCacheBuilder;
+use accelerator::config::CacheMode;
+use accelerator::{local, remote};
+
+let local_backend = local::moka::<String>().max_capacity(100_000).build()?;
+let remote_backend = remote::redis::<String>()
+    .url("redis://127.0.0.1:6379")
+    .key_prefix("demo")
+    .build()?;
+
+let cache = LevelCacheBuilder::<u64, String>::new()
+    .area("user")
+    .mode(CacheMode::Both)
+    .local(local_backend)
+    .remote(remote_backend)
+    .local_ttl(Duration::from_secs(60))
+    .remote_ttl(Duration::from_secs(300))
+    .broadcast_invalidation(true)
+    .build()?;
+```
+
+## 🍱 API 概览
+
+核心运行时：
+
+- `LevelCache<K, V, LD, LB, RB>`
+- `ReadOptions { allow_stale, disable_load }`
+- `CacheMode::{Local, Remote, Both}`
+
+主要方法：
+
+- 读取：`get`、`mget`
+- 写入：`set`、`mset`
+- 失效：`del`、`mdel`
+- 预热：`warmup`
+
+诊断与指标：
+
+- `metrics_snapshot() -> CacheMetricsSnapshot`
+- `diagnostic_snapshot() -> CacheDiagnosticSnapshot`
+- `otel_metric_points() -> Vec<OtelMetricPoint>`
+
+回源 trait：
+
+- `Loader<K, V>::load(&K) -> Future<CacheResult<Option<V>>>`
+- `MLoader<K, V>::mload(&[K]) -> Future<CacheResult<HashMap<K, Option<V>>>>`
 
 ## 🧩 宏使用说明
 
@@ -79,6 +207,84 @@ impl UserService {
 - `examples/macro_best_practice.rs`
 - `examples/macro_batch_best_practice.rs`
 
+## 🏗️ 后端扩展
+
+如需替换默认后端：
+
+1. 为本地缓存实现 `LocalBackend<V>`。
+2. 为远程缓存实现 `RemoteBackend<V>` 与 `InvalidationSubscriber`。
+3. 通过 `LevelCacheBuilder::local(...)` 与 `LevelCacheBuilder::remote(...)` 注入。
+
+运行时采用泛型静态分发，不依赖运行时 `dyn` 对象。
+
+## 🪄 示例
+
+查看 `examples/`：
+
+- `fixed_backend_best_practice.rs`（moka + redis）
+- `macro_best_practice.rs`（单 key 宏流程）
+- `macro_batch_best_practice.rs`（批量宏流程）
+- `clickstack_otlp.rs`（可选 OTLP 启动，feature `otlp`）
+
+运行：
+
+```bash
+cargo run --example fixed_backend_best_practice
+```
+
+如果 `ACCELERATOR_REDIS_URL`（默认 `redis://127.0.0.1:6379`）不可达，示例会优雅退出。
+
+## 🏎️ Benchmark 与回归门禁
+
+一键脚本：
+
+```bash
+./scripts/bench.sh
+./scripts/bench.sh bench-local --runs 3 --sample-size 60
+./scripts/bench.sh bench-redis --runs 3 --sample-size 60 --redis-url redis://127.0.0.1:6379
+./scripts/bench.sh regression --threshold 0.15
+```
+
+原生命令：
+
+```bash
+cargo bench --bench cache_path_bench -- --sample-size=60
+ACCELERATOR_BENCH_REDIS_URL=redis://127.0.0.1:0 cargo bench --bench cache_path_bench -- --sample-size=60
+cargo run --bin export_bench_baseline --
+cargo run --bin check_bench_regression -- --threshold 0.15
+```
+
+详细流程见：`docs/performance-engineering-playbook.md`
+
+## 🧪 集成测试
+
+Redis 集成测试位于 `tests/redis_integration.rs`。
+
+- 通过 `cargo test` 运行。
+- Redis 不可用时，相关测试会按设计跳过。
+- 可通过 `ACCELERATOR_TEST_REDIS_URL` 覆盖端点。
+
+## 🧰 本地全栈联调
+
+启动本地栈：
+
+```bash
+cd scripts
+docker compose up -d
+```
+
+运行端到端测试：
+
+```bash
+cargo test --test redis_integration
+cargo test --test stack_integration
+```
+
+`stack_integration` 使用真实 `sqlx + Postgres` 回源链路。
+
+ClickStack UI：`http://127.0.0.1:8080`  
+OTLP 端口：`4317` 与 `4318`
+
 ## 📚 文档导航
 
 英文文档为默认版本；中文文档位于 `docs/zh/`。
@@ -92,14 +298,3 @@ impl UserService {
 | 运维手册 | [`docs/cache-ops-runbook.md`](docs/cache-ops-runbook.md) | [`docs/zh/cache-ops-runbook.zh-CN.md`](docs/zh/cache-ops-runbook.zh-CN.md) |
 | 本地联调 | [`docs/local-stack-integration.md`](docs/local-stack-integration.md) | [`docs/zh/local-stack-integration.zh-CN.md`](docs/zh/local-stack-integration.zh-CN.md) |
 | 扁平化规范 | [`docs/code-flattening-guideline.md`](docs/code-flattening-guideline.md) | [`docs/zh/code-flattening-guideline.zh-CN.md`](docs/zh/code-flattening-guideline.zh-CN.md) |
-
-## ⚡ 快速开始
-
-```bash
-cargo run --example fixed_backend_best_practice
-```
-
-如果 Redis 不可用，可先运行本地模式示例；详细说明见：
-
-- [`docs/local-stack-integration.md`](docs/local-stack-integration.md)
-- [`docs/zh/local-stack-integration.zh-CN.md`](docs/zh/local-stack-integration.zh-CN.md)
