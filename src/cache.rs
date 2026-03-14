@@ -315,7 +315,6 @@ where
         self.ensure_invalidation_listener();
         let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        let key_hash = Self::hash_encoded_key(&encoded_key);
 
         let result = async {
             let stale_candidate = self.read_local_stale_value(&encoded_key).await?;
@@ -351,7 +350,7 @@ where
             Ok(None) => "ok_none",
             Err(_) => "error",
         };
-        self.log_operation("get", key_hash, started, result_tag, result.as_ref().err());
+        self.log_operation("get", started, result_tag, result.as_ref().err());
         result
     }
 
@@ -368,11 +367,6 @@ where
             .iter()
             .map(|key| (key.clone(), self.encoded_key(key)))
             .collect::<Vec<_>>();
-        let encoded_keys = encoded_pairs
-            .iter()
-            .map(|(_, encoded_key)| encoded_key.clone())
-            .collect::<Vec<_>>();
-        let key_hash = Self::hash_encoded_keys(&encoded_keys);
 
         let result = async {
             let mut values = HashMap::with_capacity(keys.len());
@@ -382,34 +376,11 @@ where
                 .await?;
 
             if misses.is_empty() || options.disable_load || self.loader.is_none() {
-                for (key, _) in misses {
-                    values.insert(key, None);
-                }
+                Self::fill_none_for_misses(&mut values, misses);
                 return Ok(values);
             }
 
-            if self.config.penetration_protect {
-                for (key, encoded_key) in misses {
-                    let value = self.load_on_miss(&key, &encoded_key).await?;
-                    values.insert(key, value);
-                }
-                return Ok(values);
-            }
-
-            let loader = self.configured_loader()?;
-
-            let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
-
-            let loaded_map = self
-                .call_loader_with_timeout(loader.mload(&request_keys))
-                .await?;
-
-            for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
-                let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
-                self.write_by_mode(&encoded_key, loaded.clone()).await?;
-                values.insert(key, loaded);
-            }
-
+            self.load_misses(misses, &mut values).await?;
             Ok(values)
         }
         .await;
@@ -419,7 +390,7 @@ where
             Ok(_) => "ok",
             Err(_) => "error",
         };
-        self.log_operation("mget", key_hash, started, result_tag, result.as_ref().err());
+        self.log_operation("mget", started, result_tag, result.as_ref().err());
         result
     }
 
@@ -429,9 +400,8 @@ where
         self.ensure_invalidation_listener();
         let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        let key_hash = Self::hash_encoded_key(&encoded_key);
         let result = self.write_by_mode(&encoded_key, value).await;
-        self.log_operation("set", key_hash, started, "done", result.as_ref().err());
+        self.log_operation("set", started, "done", result.as_ref().err());
         result
     }
 
@@ -440,25 +410,9 @@ where
     pub async fn mset(&self, entries: HashMap<K, Option<V>>) -> CacheResult<()> {
         self.ensure_invalidation_listener();
         let started = Instant::now();
-        let mut encoded_entries = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            encoded_entries.push((self.encoded_key(&key), value));
-        }
-        let encoded_keys = encoded_entries
-            .iter()
-            .map(|(encoded_key, _)| encoded_key.clone())
-            .collect::<Vec<_>>();
-        let key_hash = Self::hash_encoded_keys(&encoded_keys);
+        let result = self.batch_write_by_mode(entries).await;
 
-        let result = async {
-            for (encoded_key, value) in encoded_entries {
-                self.write_by_mode(&encoded_key, value).await?;
-            }
-            Ok(())
-        }
-        .await;
-
-        self.log_operation("mset", key_hash, started, "done", result.as_ref().err());
+        self.log_operation("mset", started, "done", result.as_ref().err());
         result
     }
 
@@ -468,7 +422,6 @@ where
         self.ensure_invalidation_listener();
         let started = Instant::now();
         let encoded_key = self.encoded_key(key);
-        let key_hash = Self::hash_encoded_key(&encoded_key);
 
         let result = async {
             self.delete_remote_if_needed(&encoded_key).await?;
@@ -479,7 +432,7 @@ where
         }
         .await;
 
-        self.log_operation("del", key_hash, started, "done", result.as_ref().err());
+        self.log_operation("del", started, "done", result.as_ref().err());
         result
     }
 
@@ -493,7 +446,6 @@ where
             .iter()
             .map(|key| self.encoded_key(key))
             .collect::<Vec<_>>();
-        let key_hash = Self::hash_encoded_keys(&encoded);
 
         let result = async {
             if encoded.is_empty() {
@@ -507,7 +459,7 @@ where
         }
         .await;
 
-        self.log_operation("mdel", key_hash, started, "done", result.as_ref().err());
+        self.log_operation("mdel", started, "done", result.as_ref().err());
         result
     }
 
@@ -516,11 +468,6 @@ where
     pub async fn warmup(&self, keys: &[K]) -> CacheResult<usize> {
         self.ensure_invalidation_listener();
         let started = Instant::now();
-        let encoded_keys = keys
-            .iter()
-            .map(|key| self.encoded_key(key))
-            .collect::<Vec<_>>();
-        let key_hash = Self::hash_encoded_keys(&encoded_keys);
 
         let result = async {
             if !self.config.warmup_enabled {
@@ -549,13 +496,7 @@ where
             Ok(_) => "ok_loaded",
             Err(_) => "error",
         };
-        self.log_operation(
-            "warmup",
-            key_hash,
-            started,
-            result_tag,
-            result.as_ref().err(),
-        );
+        self.log_operation("warmup", started, result_tag, result.as_ref().err());
         result
     }
 
@@ -564,27 +505,10 @@ where
         format!("{}:{}", self.config.area, (self.key_converter)(key))
     }
 
-    /// Hashes one encoded key for logging without exposing raw key content.
-    fn hash_encoded_key(encoded_key: &str) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        encoded_key.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Hashes a batch of encoded keys for logging aggregation.
-    fn hash_encoded_keys(encoded_keys: &[String]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for encoded_key in encoded_keys {
-            encoded_key.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
     /// Emits standardized operation log for governance and troubleshooting.
     fn log_operation(
         &self,
         op: &'static str,
-        key_hash: u64,
         started: Instant,
         result: &'static str,
         error: Option<&CacheError>,
@@ -597,7 +521,6 @@ where
                 target: "accelerator::ops",
                 area = %self.config.area,
                 op,
-                key_hash,
                 result,
                 latency_ms,
                 error_kind,
@@ -609,7 +532,6 @@ where
                 target: "accelerator::ops",
                 area = %self.config.area,
                 op,
-                key_hash,
                 result,
                 latency_ms,
                 error_kind,
@@ -767,7 +689,8 @@ where
         .map_err(|err| CacheError::Backend(format!("serialize invalidation failed: {err}")))?;
 
         self.metrics.inc_invalidation_publish();
-        if let Err(err) = remote.publish(&self.invalidation_channel(), &payload).await {
+        let channel = self.invalidation_channel();
+        if let Err(err) = remote.publish(&channel, &payload).await {
             self.metrics.inc_invalidation_publish_failure();
             return Err(err);
         }
@@ -1039,18 +962,66 @@ where
         Ok(remained)
     }
 
+    fn fill_none_for_misses(values: &mut HashMap<K, Option<V>>, misses: Vec<(K, String)>) {
+        for (key, _) in misses {
+            values.insert(key, None);
+        }
+    }
+
+    async fn load_misses(
+        &self,
+        misses: Vec<(K, String)>,
+        values: &mut HashMap<K, Option<V>>,
+    ) -> CacheResult<()> {
+        if self.config.penetration_protect {
+            return self.load_misses_with_singleflight(misses, values).await;
+        }
+
+        self.load_misses_with_batch_loader(misses, values).await
+    }
+
+    async fn load_misses_with_singleflight(
+        &self,
+        misses: Vec<(K, String)>,
+        values: &mut HashMap<K, Option<V>>,
+    ) -> CacheResult<()> {
+        for (key, encoded_key) in misses {
+            let loaded = self.load_on_miss(&key, &encoded_key).await?;
+            values.insert(key, loaded);
+        }
+
+        Ok(())
+    }
+
+    async fn load_misses_with_batch_loader(
+        &self,
+        misses: Vec<(K, String)>,
+        values: &mut HashMap<K, Option<V>>,
+    ) -> CacheResult<()> {
+        let loader = self.configured_loader()?;
+        let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
+        let loaded_map = self
+            .call_loader_with_timeout(loader.mload(&request_keys))
+            .await?;
+
+        for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
+            let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
+            self.write_by_mode(&encoded_key, loaded.clone()).await?;
+            values.insert(key, loaded);
+        }
+
+        Ok(())
+    }
+
     /// Writes one entry into local cache.
     async fn backfill_local(&self, encoded_key: &str, value: Option<V>) -> CacheResult<()> {
         let Some(local) = self.local.as_ref() else {
             return Ok(());
         };
 
-        local
-            .set(
-                encoded_key,
-                self.new_entry(encoded_key, value, self.config.local_ttl),
-            )
-            .await
+        let entry = self.new_entry(encoded_key, value, self.config.local_ttl);
+
+        local.set(encoded_key, entry).await
     }
 
     /// Loads value on miss, optionally through singleflight deduplication.
@@ -1130,6 +1101,96 @@ where
         }
     }
 
+    /// Writes multiple keys to cache backends through batch APIs when possible.
+    async fn batch_write_by_mode(&self, entries: HashMap<K, Option<V>>) -> CacheResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let use_local = self.mode_uses_local() && self.local.is_some();
+        let use_remote = self.mode_uses_remote() && self.remote.is_some();
+        let mut local_entries = HashMap::with_capacity(entries.len());
+        let mut remote_entries = HashMap::with_capacity(entries.len());
+        let mut delete_keys = Vec::new();
+
+        for (key, value) in entries {
+            let encoded_key = self.encoded_key(&key);
+            if value.is_none() && !self.config.cache_null_value {
+                delete_keys.push(encoded_key);
+                continue;
+            }
+
+            match (use_local, use_remote) {
+                (true, true) => {
+                    let local_entry = Self::to_entry(
+                        &encoded_key,
+                        value.clone(),
+                        self.config.local_ttl,
+                        self.config.null_ttl,
+                        self.config.ttl_jitter_ratio,
+                    );
+                    local_entries.insert(encoded_key.clone(), local_entry);
+
+                    let remote_entry = Self::to_entry(
+                        &encoded_key,
+                        value,
+                        self.config.remote_ttl,
+                        self.config.null_ttl,
+                        self.config.ttl_jitter_ratio,
+                    );
+                    remote_entries.insert(encoded_key, remote_entry);
+                }
+                (true, false) => {
+                    let local_entry = Self::to_entry(
+                        &encoded_key,
+                        value,
+                        self.config.local_ttl,
+                        self.config.null_ttl,
+                        self.config.ttl_jitter_ratio,
+                    );
+                    local_entries.insert(encoded_key, local_entry);
+                }
+                (false, true) => {
+                    let remote_entry = Self::to_entry(
+                        &encoded_key,
+                        value,
+                        self.config.remote_ttl,
+                        self.config.null_ttl,
+                        self.config.ttl_jitter_ratio,
+                    );
+                    remote_entries.insert(encoded_key, remote_entry);
+                }
+                (false, false) => {}
+            }
+        }
+
+        let remote = if use_remote {
+            self.remote.as_ref()
+        } else {
+            None
+        };
+        if let Some(remote) = remote {
+            if !remote_entries.is_empty() {
+                remote.mset(remote_entries).await?;
+            }
+            if !delete_keys.is_empty() {
+                remote.mdel(&delete_keys).await?;
+            }
+        }
+
+        let local = if use_local { self.local.as_ref() } else { None };
+        if let Some(local) = local {
+            if !local_entries.is_empty() {
+                local.mset(local_entries).await?;
+            }
+            if !delete_keys.is_empty() {
+                local.mdel(&delete_keys).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Writes one key into local backend with ttl/null policy.
     async fn write_local(
         local: &Option<LB>,
@@ -1145,18 +1206,14 @@ where
             return local.del(encoded_key).await;
         }
 
-        local
-            .set(
-                encoded_key,
-                Self::to_entry(
-                    encoded_key,
-                    value,
-                    config.local_ttl,
-                    config.null_ttl,
-                    config.ttl_jitter_ratio,
-                ),
-            )
-            .await
+        let entry = Self::to_entry(
+            encoded_key,
+            value,
+            config.local_ttl,
+            config.null_ttl,
+            config.ttl_jitter_ratio,
+        );
+        local.set(encoded_key, entry).await
     }
 
     /// Writes one key into remote backend with ttl/null policy.
@@ -1174,18 +1231,14 @@ where
             return remote.del(encoded_key).await;
         }
 
-        remote
-            .set(
-                encoded_key,
-                Self::to_entry(
-                    encoded_key,
-                    value,
-                    config.remote_ttl,
-                    config.null_ttl,
-                    config.ttl_jitter_ratio,
-                ),
-            )
-            .await
+        let entry = Self::to_entry(
+            encoded_key,
+            value,
+            config.remote_ttl,
+            config.null_ttl,
+            config.ttl_jitter_ratio,
+        );
+        remote.set(encoded_key, entry).await
     }
 
     /// Converts stored entry payload into user-facing optional value.
