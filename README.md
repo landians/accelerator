@@ -42,6 +42,8 @@ cargo run --bin check_bench_regression -- --threshold 0.15
 
 Detailed engineering guide: `docs/performance-engineering-playbook.md`.
 
+Code flattening/refactor guideline for cache paths: `docs/code-flattening-guideline.md`.
+
 ## Redis Integration Tests
 
 Integration tests that require a real Redis are in `tests/redis_integration.rs`.

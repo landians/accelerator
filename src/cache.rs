@@ -380,7 +380,8 @@ where
                 return Ok(values);
             }
 
-            self.load_misses(misses, &mut values).await?;
+            self.load_misses_with_batch_loader(misses, &mut values)
+                .await?;
             Ok(values)
         }
         .await;
@@ -968,31 +969,9 @@ where
         }
     }
 
-    async fn load_misses(
-        &self,
-        misses: Vec<(K, String)>,
-        values: &mut HashMap<K, Option<V>>,
-    ) -> CacheResult<()> {
-        if self.config.penetration_protect {
-            return self.load_misses_with_singleflight(misses, values).await;
-        }
-
-        self.load_misses_with_batch_loader(misses, values).await
-    }
-
-    async fn load_misses_with_singleflight(
-        &self,
-        misses: Vec<(K, String)>,
-        values: &mut HashMap<K, Option<V>>,
-    ) -> CacheResult<()> {
-        for (key, encoded_key) in misses {
-            let loaded = self.load_on_miss(&key, &encoded_key).await?;
-            values.insert(key, loaded);
-        }
-
-        Ok(())
-    }
-
+    /// Loads missed keys through `MLoader::mload` and writes back by cache mode.
+    ///
+    /// `mget` intentionally always uses this batched path to avoid per-key loader loops.
     async fn load_misses_with_batch_loader(
         &self,
         misses: Vec<(K, String)>,
@@ -1335,6 +1314,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1344,6 +1324,7 @@ mod tests {
     use crate::builder::LevelCacheBuilder;
     use crate::cache::ReadOptions;
     use crate::config::CacheMode;
+    use crate::loader::{Loader, MLoader};
     use crate::local;
 
     type TestBuilder = LevelCacheBuilder<u64, String>;
@@ -1358,6 +1339,43 @@ mod tests {
             .local_ttl(Duration::from_secs(60))
             .remote_ttl(Duration::from_secs(120))
             .null_ttl(Duration::from_secs(10))
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingBatchLoader {
+        load_calls: Arc<AtomicUsize>,
+        mload_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBatchLoader {
+        fn load_calls(&self) -> usize {
+            self.load_calls.load(Ordering::SeqCst)
+        }
+
+        fn mload_calls(&self) -> usize {
+            self.mload_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Loader<u64, String> for CountingBatchLoader {
+        async fn load(&self, key: &u64) -> crate::error::CacheResult<Option<String>> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(format!("single-{key}")))
+        }
+    }
+
+    impl MLoader<u64, String> for CountingBatchLoader {
+        async fn mload(
+            &self,
+            keys: &[u64],
+        ) -> crate::error::CacheResult<HashMap<u64, Option<String>>> {
+            self.mload_calls.fetch_add(1, Ordering::SeqCst);
+            let mut values = HashMap::with_capacity(keys.len());
+            for key in keys {
+                values.insert(*key, Some(format!("batch-{key}")));
+            }
+            Ok(values)
+        }
     }
 
     #[tokio::test]
@@ -1502,6 +1520,36 @@ mod tests {
         assert_eq!(values.get(&1).cloned().flatten(), Some("one".to_string()));
         assert_eq!(values.get(&2).cloned().flatten(), Some("two".to_string()));
         assert_eq!(values.get(&3).cloned().flatten(), None);
+    }
+
+    #[tokio::test]
+    async fn mget_multiple_misses_use_mloader_when_penetration_protect_enabled() {
+        let loader = CountingBatchLoader::default();
+        let cache = test_cache_builder()
+            .penetration_protect(true)
+            .loader(loader.clone())
+            .build()
+            .unwrap();
+
+        let values = cache
+            .mget(&[101, 102, 103], &ReadOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            values.get(&101).cloned().flatten(),
+            Some("batch-101".to_string())
+        );
+        assert_eq!(
+            values.get(&102).cloned().flatten(),
+            Some("batch-102".to_string())
+        );
+        assert_eq!(
+            values.get(&103).cloned().flatten(),
+            Some("batch-103".to_string())
+        );
+        assert_eq!(loader.load_calls(), 0);
+        assert_eq!(loader.mload_calls(), 1);
     }
 
     #[tokio::test]

@@ -161,7 +161,9 @@ where
         self
     }
 
-    /// Enables or disables singleflight miss deduplication.
+    /// Enables or disables singleflight deduplication for single-key miss paths.
+    ///
+    /// Batched `mget` miss handling always prefers `MLoader::mload`.
     pub fn penetration_protect(mut self, enabled: bool) -> Self {
         self.config.penetration_protect = enabled;
         self

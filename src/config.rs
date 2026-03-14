@@ -37,7 +37,9 @@ pub struct CacheConfig {
     pub ttl_jitter_ratio: Option<f64>,
     /// Whether `None` should be cached as negative-cache marker.
     pub cache_null_value: bool,
-    /// Whether to enable singleflight dedup on cache miss.
+    /// Whether to enable singleflight dedup on single-key miss load paths.
+    ///
+    /// Note: batched `mget` miss handling uses `MLoader::mload` directly.
     pub penetration_protect: bool,
     /// Optional timeout for loader `load/mload`.
     pub loader_timeout: Option<Duration>,
