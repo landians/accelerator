@@ -18,7 +18,7 @@ otlp = [
 
 [dependencies]
 moka = { version = "0.12.14", features = ["future"] }
-redis = { version = "0.32", features = ["aio", "tokio-comp"] }
+redis = { version = "1.0.5", features = ["aio", "tokio-comp"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 singleflight-async = "0.2"

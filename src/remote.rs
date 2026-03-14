@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use redis::AsyncCommands;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{InvalidationSubscriber, RemoteBackend, StoredEntry, StoredValue};
 use crate::error::{CacheError, CacheResult};
@@ -35,6 +37,8 @@ where
     client: redis::Client,
     /// Optional key prefix to isolate logical business domains.
     key_prefix: String,
+    /// Lazily initialized shared multiplexed connection.
+    connection: Arc<AsyncMutex<Option<redis::aio::MultiplexedConnection>>>,
     /// Type marker.
     _marker: PhantomData<V>,
 }
@@ -48,6 +52,7 @@ where
         Self {
             client,
             key_prefix,
+            connection: Arc::new(AsyncMutex::new(None)),
             _marker: PhantomData,
         }
     }
@@ -94,10 +99,18 @@ where
 
     /// Opens a multiplexed async redis connection.
     async fn connection(&self) -> CacheResult<redis::aio::MultiplexedConnection> {
-        self.client
+        let mut slot = self.connection.lock().await;
+        if let Some(conn) = slot.as_ref() {
+            return Ok(conn.clone());
+        }
+
+        let conn = self
+            .client
             .get_multiplexed_async_connection()
             .await
-            .map_err(|err| CacheError::Backend(format!("redis connection failed: {err}")))
+            .map_err(|err| CacheError::Backend(format!("redis connection failed: {err}")))?;
+        *slot = Some(conn.clone());
+        Ok(conn)
     }
 
     /// Reads one key from redis.
