@@ -510,11 +510,11 @@ mod tests {
         .await
         .unwrap();
 
-        let message = time::timeout(Duration::from_secs(2), subscriber.next_message())
+        let received = time::timeout(Duration::from_secs(2), subscriber.next_message())
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .expect("subscriber timed out waiting for message");
+        let payload_result = received.expect("subscriber stream ended unexpectedly");
+        let message = payload_result.expect("subscriber returned payload decode error");
         assert_eq!(message, "hello-subscriber");
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -395,21 +396,13 @@ where
                 return Ok(values);
             }
 
-            let loader = self
-                .loader
-                .as_ref()
-                .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
+            let loader = self.configured_loader()?;
 
             let (request_keys, encoded_keys): (Vec<K>, Vec<String>) = misses.into_iter().unzip();
 
-            let loaded_map = if let Some(timeout) = self.config.loader_timeout {
-                match time::timeout(timeout, loader.mload(&request_keys)).await {
-                    Ok(value) => value,
-                    Err(_) => return Err(CacheError::Timeout("loader")),
-                }
-            } else {
-                loader.mload(&request_keys).await
-            }?;
+            let loaded_map = self
+                .call_loader_with_timeout(loader.mload(&request_keys))
+                .await?;
 
             for (key, encoded_key) in request_keys.into_iter().zip(encoded_keys) {
                 let loaded = loaded_map.get(&key).cloned().unwrap_or(None);
@@ -1082,27 +1075,15 @@ where
 
     /// Executes loader with timeout/metrics and writes result back to cache.
     async fn load_and_write(&self, key: &K, encoded_key: &str) -> CacheResult<Option<V>> {
-        let loader = self
-            .loader
-            .as_ref()
-            .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
+        let loader = self.configured_loader()?;
 
         self.metrics.inc_load_total();
-        let load_future = loader.load(key);
-        let loaded = if let Some(timeout) = self.config.loader_timeout {
-            match time::timeout(timeout, load_future).await {
-                Ok(value) => value,
-                Err(_) => {
-                    self.metrics.inc_load_timeout();
-                    return Err(CacheError::Timeout("loader"));
-                }
-            }
-        } else {
-            load_future.await
-        };
-
-        let loaded = match loaded {
+        let loaded = match self.call_loader_with_timeout(loader.load(key)).await {
             Ok(value) => value,
+            Err(err @ CacheError::Timeout(_)) => {
+                self.metrics.inc_load_timeout();
+                return Err(err);
+            }
             Err(err) => {
                 self.metrics.inc_load_error();
                 return Err(err);
@@ -1112,6 +1093,25 @@ where
         self.metrics.inc_load_success();
         self.write_by_mode(encoded_key, loaded.clone()).await?;
         Ok(loaded)
+    }
+
+    fn configured_loader(&self) -> CacheResult<&LD> {
+        self.loader
+            .as_ref()
+            .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))
+    }
+
+    async fn call_loader_with_timeout<T, Fut>(&self, future: Fut) -> CacheResult<T>
+    where
+        Fut: Future<Output = CacheResult<T>>,
+    {
+        if let Some(timeout) = self.config.loader_timeout {
+            return time::timeout(timeout, future)
+                .await
+                .map_err(|_| CacheError::Timeout("loader"))?;
+        }
+
+        future.await
     }
 
     /// Writes one key to cache backends according to configured mode.

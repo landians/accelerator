@@ -445,13 +445,11 @@ mod tests {
 
     #[test]
     fn build_fails_without_required_backends() {
-        let err = match LevelCacheBuilder::<u64, String>::new()
+        let err = LevelCacheBuilder::<u64, String>::new()
             .mode(CacheMode::Both)
             .build()
-        {
-            Ok(_) => panic!("expected build to fail when required backends are missing"),
-            Err(err) => err,
-        };
+            .err()
+            .expect("expected build to fail when required backends are missing");
 
         assert!(format!("{err}").contains("both local and remote backends"));
     }
@@ -460,15 +458,13 @@ mod tests {
     fn build_fails_on_zero_ttls() {
         let local_backend = local::moka::<String>().build().unwrap();
 
-        let err = match LevelCacheBuilder::<u64, String>::new()
+        let err = LevelCacheBuilder::<u64, String>::new()
             .mode(CacheMode::Local)
             .local(local_backend)
             .local_ttl(Duration::ZERO)
             .build()
-        {
-            Ok(_) => panic!("expected build to fail when local_ttl is zero"),
-            Err(err) => err,
-        };
+            .err()
+            .expect("expected build to fail when local_ttl is zero");
 
         assert!(format!("{err}").contains("local_ttl"));
     }
@@ -490,15 +486,13 @@ mod tests {
     fn build_fails_on_invalid_ttl_jitter_ratio() {
         let local_backend = local::moka::<String>().build().unwrap();
 
-        let err = match LevelCacheBuilder::<u64, String>::new()
+        let err = LevelCacheBuilder::<u64, String>::new()
             .mode(CacheMode::Local)
             .local(local_backend)
             .ttl_jitter_ratio(1.5)
             .build()
-        {
-            Ok(_) => panic!("expected build to fail when ttl_jitter_ratio is invalid"),
-            Err(err) => err,
-        };
+            .err()
+            .expect("expected build to fail when ttl_jitter_ratio is invalid");
 
         assert!(format!("{err}").contains("ttl_jitter_ratio"));
     }
@@ -507,15 +501,13 @@ mod tests {
     fn build_fails_on_zero_warmup_batch_size() {
         let local_backend = local::moka::<String>().build().unwrap();
 
-        let err = match LevelCacheBuilder::<u64, String>::new()
+        let err = LevelCacheBuilder::<u64, String>::new()
             .mode(CacheMode::Local)
             .local(local_backend)
             .warmup_batch_size(0)
             .build()
-        {
-            Ok(_) => panic!("expected build to fail when warmup_batch_size is zero"),
-            Err(err) => err,
-        };
+            .err()
+            .expect("expected build to fail when warmup_batch_size is zero");
 
         assert!(format!("{err}").contains("warmup_batch_size"));
     }
