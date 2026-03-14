@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "benchmarks": {
+    "batch/hit_macro/32": {
+      "mean_ns": 18954.401518735664,
+      "median_ns": 18886.876097582262
+    },
+    "batch/hit_manual/32": {
+      "mean_ns": 17680.229905239114,
+      "median_ns": 17484.21239345921
+    },
+    "batch/miss_macro/32": {
+      "mean_ns": 96403.534355292,
+      "median_ns": 95362.33004385963
+    },
+    "batch/miss_manual/32": {
+      "mean_ns": 90069.09604678948,
+      "median_ns": 90084.8010864036
+    },
+    "single_key/hit_macro": {
+      "mean_ns": 504.92047398370806,
+      "median_ns": 501.92173387353375
+    },
+    "single_key/hit_manual": {
+      "mean_ns": 503.688670076487,
+      "median_ns": 495.883576521627
+    },
+    "single_key/miss_macro": {
+      "mean_ns": 3149.406151321083,
+      "median_ns": 3111.889958800857
+    },
+    "single_key/miss_manual": {
+      "mean_ns": 3002.3433686475005,
+      "median_ns": 2996.776124304836
+    }
+  }
+}

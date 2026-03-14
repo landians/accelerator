@@ -1,0 +1,51 @@
+name: accelerator-stack
+
+services:
+  redis:
+    image: redis:8.0
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-data:/data
+
+  postgres:
+    image: postgres:17.0
+    environment:
+      POSTGRES_USER: accelerator
+      POSTGRES_PASSWORD: accelerator
+      POSTGRES_DB: accelerator
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accelerator -d accelerator"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  clickstack:
+    image: clickhouse/clickstack-all-in-one:2
+    ports:
+      - "8080:8080"
+      - "4317:4317"
+      - "4318:4318"
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickstack-data:/data/db
+      - clickstack-clickhouse-data:/var/lib/clickhouse
+      - clickstack-clickhouse-logs:/var/log/clickhouse-server
+
+volumes:
+  redis-data:
+  postgres-data:
+  clickstack-data:
+  clickstack-clickhouse-data:
+  clickstack-clickhouse-logs:
