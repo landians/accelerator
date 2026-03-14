@@ -136,6 +136,72 @@ impl CacheMetrics {
                 .load(Ordering::Relaxed),
         }
     }
+
+    fn inc_local_hit(&self) {
+        self.local_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_local_miss(&self) {
+        self.local_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_remote_hit(&self) {
+        self.remote_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_remote_miss(&self) {
+        self.remote_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_load_total(&self) {
+        self.load_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_load_success(&self) {
+        self.load_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_load_timeout(&self) {
+        self.load_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_load_error(&self) {
+        self.load_error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_stale_fallback(&self) {
+        self.stale_fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_refresh_attempt(&self) {
+        self.refresh_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_refresh_success(&self) {
+        self.refresh_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_refresh_failure(&self) {
+        self.refresh_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_invalidation_publish(&self) {
+        self.invalidation_publish.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_invalidation_publish_failure(&self) {
+        self.invalidation_publish_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_invalidation_receive(&self) {
+        self.invalidation_receive.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_invalidation_receive_failure(&self) {
+        self.invalidation_receive_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Pub/Sub payload used for cross-node local cache invalidation.
@@ -641,33 +707,17 @@ where
             let mut subscriber = match remote.subscribe(&channel).await {
                 Ok(subscriber) => subscriber,
                 Err(_) => {
-                    metrics
-                        .invalidation_receive_failures
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.inc_invalidation_receive_failure();
                     retry_tick.tick().await;
                     continue;
                 }
             };
 
-            while let Some(payload) = subscriber.next_message().await {
-                let payload = match payload {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        metrics
-                            .invalidation_receive_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-
-                let event: InvalidationMessage = match serde_json::from_str(&payload) {
-                    Ok(event) => event,
-                    Err(_) => {
-                        metrics
-                            .invalidation_receive_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
+            while let Some(payload_result) = subscriber.next_message().await {
+                let Some(event) =
+                    Self::decode_invalidation_message(payload_result, metrics.as_ref())
+                else {
+                    continue;
                 };
 
                 if event.keys.is_empty() {
@@ -675,16 +725,31 @@ where
                 }
 
                 if local.mdel(&event.keys).await.is_err() {
-                    metrics
-                        .invalidation_receive_failures
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.inc_invalidation_receive_failure();
                     continue;
                 }
-                metrics.invalidation_receive.fetch_add(1, Ordering::Relaxed);
+                metrics.inc_invalidation_receive();
             }
 
             retry_tick.tick().await;
         }
+    }
+
+    fn decode_invalidation_message(
+        payload_result: CacheResult<String>,
+        metrics: &CacheMetrics,
+    ) -> Option<InvalidationMessage> {
+        let Ok(payload) = payload_result else {
+            metrics.inc_invalidation_receive_failure();
+            return None;
+        };
+
+        let Ok(event) = serde_json::from_str::<InvalidationMessage>(&payload) else {
+            metrics.inc_invalidation_receive_failure();
+            return None;
+        };
+
+        Some(event)
     }
 
     /// Publishes delete invalidation events when configured.
@@ -708,13 +773,9 @@ where
         })
         .map_err(|err| CacheError::Backend(format!("serialize invalidation failed: {err}")))?;
 
-        self.metrics
-            .invalidation_publish
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_invalidation_publish();
         if let Err(err) = remote.publish(&self.invalidation_channel(), &payload).await {
-            self.metrics
-                .invalidation_publish_failures
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_invalidation_publish_failure();
             return Err(err);
         }
 
@@ -750,7 +811,7 @@ where
             return Err(err);
         };
 
-        self.metrics.stale_fallback.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_stale_fallback();
         Ok(value)
     }
 
@@ -771,17 +832,13 @@ where
             return;
         }
 
-        self.metrics
-            .refresh_attempts
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_refresh_attempt();
         match self.load_on_miss(key, encoded_key).await {
             Ok(_) => {
-                self.metrics.refresh_success.fetch_add(1, Ordering::Relaxed);
+                self.metrics.inc_refresh_success();
             }
             Err(_) => {
-                self.metrics
-                    .refresh_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.inc_refresh_failure();
             }
         }
     }
@@ -798,9 +855,9 @@ where
 
         let entry = local.get(encoded_key).await?;
         if entry.is_some() {
-            self.metrics.local_hit.fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_local_hit();
         } else {
-            self.metrics.local_miss.fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_local_miss();
         }
         Ok(entry)
     }
@@ -819,11 +876,11 @@ where
         };
 
         let Some(entry) = remote.get(encoded_key).await? else {
-            self.metrics.remote_miss.fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_remote_miss();
             return Ok(None);
         };
 
-        self.metrics.remote_hit.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_remote_hit();
         let value = Self::entry_to_value(entry);
         self.backfill_local_if_needed(encoded_key, value.clone())
             .await?;
@@ -915,16 +972,15 @@ where
 
         let mut misses = Vec::new();
         for (key, encoded_key) in encoded_pairs {
-            match local_values.get(&encoded_key).cloned().flatten() {
-                Some(entry) => {
-                    self.metrics.local_hit.fetch_add(1, Ordering::Relaxed);
-                    values.insert(key, Self::entry_to_value(entry));
-                }
-                None => {
-                    self.metrics.local_miss.fetch_add(1, Ordering::Relaxed);
-                    misses.push((key, encoded_key));
-                }
-            }
+            let Some(entry) = local_values.get(&encoded_key).cloned().flatten() else {
+                self.metrics.inc_local_miss();
+                misses.push((key, encoded_key));
+                continue;
+            };
+
+            self.metrics.inc_local_hit();
+            let value = Self::entry_to_value(entry);
+            values.insert(key, value);
         }
 
         Ok(misses)
@@ -954,29 +1010,28 @@ where
         let mut remained = Vec::new();
 
         for (key, encoded_key) in misses {
-            match remote_values.get(&encoded_key).cloned().flatten() {
-                Some(entry) => {
-                    self.metrics.remote_hit.fetch_add(1, Ordering::Relaxed);
-                    let value = Self::entry_to_value(entry);
-                    if can_backfill_local {
-                        backfill_entries.insert(
-                            encoded_key.clone(),
-                            Self::to_entry(
-                                &encoded_key,
-                                value.clone(),
-                                self.config.local_ttl,
-                                self.config.null_ttl,
-                                self.config.ttl_jitter_ratio,
-                            ),
-                        );
-                    }
-                    values.insert(key, value);
-                }
-                None => {
-                    self.metrics.remote_miss.fetch_add(1, Ordering::Relaxed);
-                    remained.push((key, encoded_key));
-                }
+            let Some(entry) = remote_values.get(&encoded_key).cloned().flatten() else {
+                self.metrics.inc_remote_miss();
+                remained.push((key, encoded_key));
+                continue;
+            };
+
+            self.metrics.inc_remote_hit();
+            let value = Self::entry_to_value(entry);
+            values.insert(key, value.clone());
+
+            if !can_backfill_local {
+                continue;
             }
+
+            let backfill_entry = Self::to_entry(
+                &encoded_key,
+                value,
+                self.config.local_ttl,
+                self.config.null_ttl,
+                self.config.ttl_jitter_ratio,
+            );
+            backfill_entries.insert(encoded_key, backfill_entry);
         }
 
         if backfill_entries.is_empty() {
@@ -1032,13 +1087,13 @@ where
             .as_ref()
             .ok_or_else(|| CacheError::InvalidConfig("loader is not configured".to_string()))?;
 
-        self.metrics.load_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_load_total();
         let load_future = loader.load(key);
         let loaded = if let Some(timeout) = self.config.loader_timeout {
             match time::timeout(timeout, load_future).await {
                 Ok(value) => value,
                 Err(_) => {
-                    self.metrics.load_timeout.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.inc_load_timeout();
                     return Err(CacheError::Timeout("loader"));
                 }
             }
@@ -1049,12 +1104,12 @@ where
         let loaded = match loaded {
             Ok(value) => value,
             Err(err) => {
-                self.metrics.load_error.fetch_add(1, Ordering::Relaxed);
+                self.metrics.inc_load_error();
                 return Err(err);
             }
         };
 
-        self.metrics.load_success.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_load_success();
         self.write_by_mode(encoded_key, loaded.clone()).await?;
         Ok(loaded)
     }
