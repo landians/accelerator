@@ -352,55 +352,39 @@ mod tests {
     struct FakeLocalBackend;
 
     impl LocalBackend<String> for FakeLocalBackend {
-        fn get(
-            &self,
-            _key: &str,
-        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
-            async move { Ok(None) }
+        async fn get(&self, _key: &str) -> CacheResult<Option<StoredEntry<String>>> {
+            Ok(None)
         }
 
-        fn peek(
-            &self,
-            _key: &str,
-        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
-            async move { Ok(None) }
+        async fn peek(&self, _key: &str) -> CacheResult<Option<StoredEntry<String>>> {
+            Ok(None)
         }
 
-        fn mget(
+        async fn mget(
             &self,
             keys: &[String],
-        ) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<String>>>>> + Send
-        {
-            async move {
-                let mut values = HashMap::with_capacity(keys.len());
-                for key in keys {
-                    values.insert(key.clone(), None);
-                }
-                Ok(values)
+        ) -> CacheResult<HashMap<String, Option<StoredEntry<String>>>> {
+            let mut values = HashMap::with_capacity(keys.len());
+            for key in keys {
+                values.insert(key.clone(), None);
             }
+            Ok(values)
         }
 
-        fn set(
-            &self,
-            _key: &str,
-            _entry: StoredEntry<String>,
-        ) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn set(&self, _key: &str, _entry: StoredEntry<String>) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn mset(
-            &self,
-            _entries: HashMap<String, StoredEntry<String>>,
-        ) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn mset(&self, _entries: HashMap<String, StoredEntry<String>>) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn del(&self, _key: &str) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn del(&self, _key: &str) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn mdel(&self, _keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn mdel(&self, _keys: &[String]) -> CacheResult<()> {
+            Ok(())
         }
     }
 
@@ -408,8 +392,8 @@ mod tests {
     struct FakeSubscriber;
 
     impl InvalidationSubscriber for FakeSubscriber {
-        fn next_message(&mut self) -> impl Future<Output = Option<CacheResult<String>>> + Send {
-            async move { None }
+        async fn next_message(&mut self) -> Option<CacheResult<String>> {
+            None
         }
     }
 
@@ -419,63 +403,43 @@ mod tests {
     impl RemoteBackend<String> for FakeRemoteBackend {
         type Subscriber = FakeSubscriber;
 
-        fn get(
-            &self,
-            _key: &str,
-        ) -> impl Future<Output = CacheResult<Option<StoredEntry<String>>>> + Send {
-            async move { Ok(None) }
+        async fn get(&self, _key: &str) -> CacheResult<Option<StoredEntry<String>>> {
+            Ok(None)
         }
 
-        fn mget(
+        async fn mget(
             &self,
             keys: &[String],
-        ) -> impl Future<Output = CacheResult<HashMap<String, Option<StoredEntry<String>>>>> + Send
-        {
-            async move {
-                let mut values = HashMap::with_capacity(keys.len());
-                for key in keys {
-                    values.insert(key.clone(), None);
-                }
-                Ok(values)
+        ) -> CacheResult<HashMap<String, Option<StoredEntry<String>>>> {
+            let mut values = HashMap::with_capacity(keys.len());
+            for key in keys {
+                values.insert(key.clone(), None);
             }
+            Ok(values)
         }
 
-        fn set(
-            &self,
-            _key: &str,
-            _entry: StoredEntry<String>,
-        ) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn set(&self, _key: &str, _entry: StoredEntry<String>) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn mset(
-            &self,
-            _entries: HashMap<String, StoredEntry<String>>,
-        ) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn mset(&self, _entries: HashMap<String, StoredEntry<String>>) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn del(&self, _key: &str) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn del(&self, _key: &str) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn mdel(&self, _keys: &[String]) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn mdel(&self, _keys: &[String]) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn publish(
-            &self,
-            _channel: &str,
-            _payload: &str,
-        ) -> impl Future<Output = CacheResult<()>> + Send {
-            async move { Ok(()) }
+        async fn publish(&self, _channel: &str, _payload: &str) -> CacheResult<()> {
+            Ok(())
         }
 
-        fn subscribe(
-            &self,
-            _channel: &str,
-        ) -> impl Future<Output = CacheResult<Self::Subscriber>> + Send {
-            async move { Ok(FakeSubscriber) }
+        async fn subscribe(&self, _channel: &str) -> CacheResult<Self::Subscriber> {
+            Ok(FakeSubscriber)
         }
     }
 

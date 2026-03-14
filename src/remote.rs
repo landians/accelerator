@@ -354,11 +354,167 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use redis::AsyncCommands;
+    use tokio::time;
+
+    use crate::backend::{InvalidationSubscriber, RemoteBackend, StoredEntry, StoredValue};
     use crate::remote;
+
+    fn redis_url() -> String {
+        std::env::var("ACCELERATOR_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    }
+
+    fn unique_scope(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{tag}-{}-{nanos}", std::process::id())
+    }
+
+    async fn redis_ready(url: &str) -> bool {
+        let client = match redis::Client::open(url) {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(_) => return false,
+        };
+
+        conn.ping::<String>().await.is_ok()
+    }
+
+    async fn redis_backend_or_skip(test_name: &str) -> Option<remote::RedisBackend<String>> {
+        let url = redis_url();
+        if !redis_ready(&url).await {
+            eprintln!("skip `{test_name}`: redis is not reachable at {url}");
+            return None;
+        }
+
+        let backend = remote::redis::<String>()
+            .url(url)
+            .key_prefix(unique_scope(test_name))
+            .build()
+            .unwrap();
+        Some(backend)
+    }
 
     #[test]
     fn redis_builder_validates_url() {
         let backend = remote::redis::<String>().url("not-a-redis-url").build();
         assert!(backend.is_err());
+    }
+
+    #[tokio::test]
+    async fn redis_backend_roundtrip_and_batch_ops() {
+        let Some(backend) = redis_backend_or_skip("redis_backend_roundtrip_and_batch_ops").await
+        else {
+            return;
+        };
+
+        backend
+            .set(
+                "k1",
+                StoredEntry {
+                    value: StoredValue::Value("v1".to_string()),
+                    expire_at: Instant::now() + Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .set(
+                "k_null",
+                StoredEntry {
+                    value: StoredValue::Null,
+                    expire_at: Instant::now() + Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut batch_entries = HashMap::new();
+        batch_entries.insert(
+            "k2".to_string(),
+            StoredEntry {
+                value: StoredValue::Value("v2".to_string()),
+                expire_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        batch_entries.insert(
+            "k3".to_string(),
+            StoredEntry {
+                value: StoredValue::Null,
+                expire_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        backend.mset(batch_entries).await.unwrap();
+
+        let value = backend.get("k1").await.unwrap().unwrap();
+        assert_eq!(value.value, StoredValue::Value("v1".to_string()));
+        let null_value = backend.get("k_null").await.unwrap().unwrap();
+        assert_eq!(null_value.value, StoredValue::Null);
+
+        let queried = vec!["k2".to_string(), "k3".to_string(), "k_missing".to_string()];
+        let values = backend.mget(&queried).await.unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.get("k2").cloned().flatten().map(|entry| entry.value),
+            Some(StoredValue::Value("v2".to_string()))
+        );
+        assert_eq!(
+            values.get("k3").cloned().flatten().map(|entry| entry.value),
+            Some(StoredValue::Null)
+        );
+        assert!(values.get("k_missing").cloned().flatten().is_none());
+
+        backend.del("k1").await.unwrap();
+        assert!(backend.get("k1").await.unwrap().is_none());
+        backend
+            .mdel(&["k2".to_string(), "k3".to_string(), "k_null".to_string()])
+            .await
+            .unwrap();
+        let after_delete = backend
+            .mget(&["k2".to_string(), "k3".to_string(), "k_null".to_string()])
+            .await
+            .unwrap();
+        assert!(after_delete.values().all(|entry| entry.is_none()));
+    }
+
+    #[tokio::test]
+    async fn redis_backend_publish_subscribe_roundtrip() {
+        let Some(backend) =
+            redis_backend_or_skip("redis_backend_publish_subscribe_roundtrip").await
+        else {
+            return;
+        };
+
+        let channel = unique_scope("remote-unit-channel");
+        let mut subscriber =
+            <remote::RedisBackend<String> as RemoteBackend<String>>::subscribe(&backend, &channel)
+                .await
+                .unwrap();
+        time::sleep(Duration::from_millis(20)).await;
+
+        <remote::RedisBackend<String> as RemoteBackend<String>>::publish(
+            &backend,
+            &channel,
+            "hello-subscriber",
+        )
+        .await
+        .unwrap();
+
+        let message = time::timeout(Duration::from_secs(2), subscriber.next_message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message, "hello-subscriber");
     }
 }
