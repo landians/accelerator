@@ -10,18 +10,13 @@ use crate::error::CacheResult;
 /// Design notes:
 /// - This trait is intentionally async because loader implementations are
 ///   usually IO-bound (DB/HTTP/RPC).
-/// - We keep `#[allow(async_fn_in_trait)]` because this crate is currently a
-///   fixed-backend library and does not require `dyn Loader` object safety.
+/// - Methods return `impl Future + Send` to make the async contract explicit
+///   without lint suppression.
 /// - Returning `Option<V>` allows negative caching semantics:
 ///   `Ok(None)` means "query succeeded but row not found".
-#[allow(async_fn_in_trait)]
-pub trait Loader<K, V>: Send + Sync
-where
-    K: Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
+pub trait Loader<K, V>: Send + Sync {
     /// Loads one key from the source-of-truth backend.
-    async fn load(&self, key: &K) -> CacheResult<Option<V>>;
+    fn load(&self, key: &K) -> impl Future<Output = CacheResult<Option<V>>> + Send;
 }
 
 /// Batch loader abstraction built on top of `Loader`.
@@ -30,14 +25,9 @@ where
 /// in `Option` to preserve not-found semantics per key. Returning a map aligns
 /// better with real-world repository APIs where response order may not match
 /// request order.
-#[allow(async_fn_in_trait)]
-pub trait MLoader<K, V>: Loader<K, V>
-where
-    K: Clone + Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
+pub trait MLoader<K, V>: Loader<K, V> {
     /// Loads a batch of keys and returns per-key optional values.
-    async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>>;
+    fn mload(&self, keys: &[K]) -> impl Future<Output = CacheResult<HashMap<K, Option<V>>>> + Send;
 }
 
 /// Built-in no-op loader used when user does not configure a loader.
@@ -46,8 +36,7 @@ pub struct NoopLoader;
 
 impl<K, V> Loader<K, V> for NoopLoader
 where
-    K: Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Sync,
 {
     /// Always returns miss to indicate "loader unavailable".
     async fn load(&self, _key: &K) -> CacheResult<Option<V>> {
@@ -57,8 +46,7 @@ where
 
 impl<K, V> MLoader<K, V> for NoopLoader
 where
-    K: Clone + Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Sync,
 {
     /// Returns an all-miss map for requested keys.
     async fn mload(&self, keys: &[K]) -> CacheResult<HashMap<K, Option<V>>> {
