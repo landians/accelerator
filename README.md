@@ -52,15 +52,13 @@ It provides a unified API over local cache (L1) and remote cache (L2), with miss
 
 ## 📦 Installation
 
-Use as a local workspace crate:
+Use from crates.io (recommended):
 
 ```toml
 [dependencies]
-accelerator = { path = "/path/to/accelerator" }
+accelerator = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
-
-If you publish/use from registry, replace with the registry version.
 
 ## 🤠 Quick Start
 
